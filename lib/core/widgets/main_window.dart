@@ -1,9 +1,11 @@
 import 'dart:io';
 
+import 'package:flutter/services.dart';
 import 'package:dio/dio.dart';
 import 'package:download_manager/core/theme/app_colors.dart';
 import 'package:download_manager/features/downloads/services/download_service.dart';
 import 'package:material_ui/material_ui.dart';
+import 'package:clipboard_watcher/clipboard_watcher.dart';
 
 class MainWindow extends StatefulWidget {
   const new({super.key});
@@ -12,13 +14,15 @@ class MainWindow extends StatefulWidget {
   State<MainWindow> createState() => _MainWindowState();
 }
 
-class _MainWindowState extends State<MainWindow> {
+class _MainWindowState extends State<MainWindow> with ClipboardListener {
   String selectedCategory = 'All Downloads';
   int selectedFileIndex = 0;
   int? _activeDownloadIndex;
   bool _isDownloadRunning = false;
   int _lastReceivedBytes = 0;
   DateTime? _lastProgressTime;
+  bool _isAddDialogOpen = false;
+  bool _isPauseRequested = false;
   final DownloadService _downloadService = DownloadService();
 
   CancelToken? _downloadCancelToken;
@@ -59,6 +63,47 @@ class _MainWindowState extends State<MainWindow> {
     ['No Hard Feelings.mp3', '8.5 MB', 'Finished', '—', '—', '100'],
     ['Competition.pdf', '12 MB', 'Finished', '—', '—', '100'],
   ];
+  @override
+  void initState() {
+    super.initState();
+
+    clipboardWatcher.addListener(this);
+    clipboardWatcher.start();
+  }
+
+  @override
+  void dispose() {
+    clipboardWatcher.removeListener(this);
+    clipboardWatcher.stop();
+
+    super.dispose();
+  }
+
+  @override
+  Future<void> onClipboardChanged() async {
+    final data = await Clipboard.getData(Clipboard.kTextPlain);
+    final text = data?.text?.trim();
+
+    if (!mounted || text == null || text.isEmpty) return;
+
+    final uri = Uri.tryParse(text);
+
+    if (uri == null ||
+        !uri.hasAuthority ||
+        (uri.scheme != 'http' && uri.scheme != 'https')) {
+      return;
+    }
+
+    if (_isAddDialogOpen) return;
+
+    _isAddDialogOpen = true;
+
+    try {
+      await _showAddDownloadDialog(initialUrl: text);
+    } finally {
+      _isAddDialogOpen = false;
+    }
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -150,11 +195,13 @@ class _MainWindowState extends State<MainWindow> {
         '$userProfile${Platform.pathSeparator}'
         'Downloads${Platform.pathSeparator}$fileName';
 
+    final shouldResume = file[2] == 'Paused';
     final cancelToken = CancelToken();
 
     _isDownloadRunning = true;
     _downloadCancelToken = cancelToken;
     _activeDownloadIndex = selectedFileIndex;
+    _isPauseRequested = false;
     _lastReceivedBytes = 0;
     _lastProgressTime = null;
 
@@ -162,61 +209,93 @@ class _MainWindowState extends State<MainWindow> {
       file[2] = 'Downloading';
       file[3] = 'Connecting...';
       file[4] = 'Calculating...';
-      file[5] = '0';
+
+      if (!shouldResume) {
+        file[5] = '0';
+      }
     });
 
+    bool downloadCompleted = false;
+
     try {
-      await _downloadService.downloadFile(
-        url: url,
-        savePath: savePath,
-        cancelToken: cancelToken,
-        onProgress: (received, total) {
-          if (!mounted) return;
+      int downloadedBytes = 0;
 
-          final now = DateTime.now();
-          final previousTime = _lastProgressTime;
+      if (shouldResume) {
+        downloadedBytes = await _downloadService.getDownloadedBytes(savePath);
+      }
 
-          if (previousTime != null) {
-            final elapsed = now.difference(previousTime).inMilliseconds / 1000;
+      void progressCallback(int received, int total) {
+        if (!mounted) return;
 
-            if (elapsed >= 1) {
-              final downloadedBytes = received - _lastReceivedBytes;
-              final speed = downloadedBytes / elapsed;
+        final now = DateTime.now();
+        final previousTime = _lastProgressTime;
 
-              if (speed > 0) {
-                final speedMB = speed / (1024 * 1024);
+        if (previousTime != null) {
+          final elapsed = now.difference(previousTime).inMilliseconds / 1000;
 
-                file[3] = '${speedMB.toStringAsFixed(2)} MB/s';
+          if (elapsed >= 1) {
+            final downloadedBytes = received - _lastReceivedBytes;
+            final speed = downloadedBytes / elapsed;
 
-                if (total > 0) {
-                  final remainingBytes = total - received;
-                  final remainingSeconds = remainingBytes / speed;
+            if (speed > 0) {
+              file[3] = '${(speed / (1024 * 1024)).toStringAsFixed(2)} MB/s';
 
-                  final minutes = remainingSeconds ~/ 60;
-                  final seconds = remainingSeconds.toInt() % 60;
+              if (total > 0) {
+                final remainingSeconds = (total - received) / speed;
+                final minutes = remainingSeconds ~/ 60;
+                final seconds = remainingSeconds.toInt() % 60;
 
-                  file[4] =
-                      '${minutes.toString().padLeft(2, '0')}:'
-                      '${seconds.toString().padLeft(2, '0')}';
-                }
+                file[4] =
+                    '${minutes.toString().padLeft(2, '0')}:'
+                    '${seconds.toString().padLeft(2, '0')}';
               }
-
-              _lastReceivedBytes = received;
-              _lastProgressTime = now;
             }
-          } else {
+
             _lastReceivedBytes = received;
             _lastProgressTime = now;
           }
+        } else {
+          _lastReceivedBytes = received;
+          _lastProgressTime = now;
+        }
 
-          setState(() {
-            if (total > 0) {
-              file[5] = ((received / total) * 100).toStringAsFixed(0);
+        setState(() {
+          if (total > 0) {
+            file[5] = ((received / total) * 100).toStringAsFixed(0);
+            if (total >= 1024 * 1024 * 1024) {
+              file[1] =
+                  '${(total / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
+            } else {
               file[1] = '${(total / (1024 * 1024)).toStringAsFixed(2)} MB';
             }
-          });
-        },
-      );
+          }
+        });
+      }
+
+      if (shouldResume && downloadedBytes > 0) {
+        final canResume = await _downloadService.supportsResume(url);
+
+        if (!canResume) {
+          throw Exception('Server does not support download resume.');
+        }
+
+        _lastReceivedBytes = downloadedBytes;
+
+        await _downloadService.resumeDownload(
+          url: url,
+          savePath: savePath,
+          downloadedBytes: downloadedBytes,
+          cancelToken: cancelToken,
+          onProgress: progressCallback,
+        );
+      } else {
+        await _downloadService.downloadFile(
+          url: url,
+          savePath: savePath,
+          cancelToken: cancelToken,
+          onProgress: progressCallback,
+        );
+      }
 
       if (!mounted) return;
 
@@ -227,6 +306,8 @@ class _MainWindowState extends State<MainWindow> {
         file[5] = '100';
       });
 
+      downloadCompleted = true;
+
       ScaffoldMessenger.of(
         context,
       ).showSnackBar(SnackBar(content: Text('Download completed: $fileName')));
@@ -236,13 +317,27 @@ class _MainWindowState extends State<MainWindow> {
       final cancelled =
           error is DioException && error.type == DioExceptionType.cancel;
 
+      final paused = cancelled && _isPauseRequested;
+      if (cancelled && !paused) {
+        final partialFile = File(savePath);
+
+        if (await partialFile.exists()) {
+          await partialFile.delete();
+        }
+      }
+
+      if (!mounted) return;
+
       setState(() {
-        file[2] = cancelled ? 'Stopped' : 'Stopped';
+        file[2] = paused ? 'Paused' : 'Stopped';
         file[3] = '—';
         file[4] = '—';
+        if (!paused) {
+          file[5] = '0';
+        }
       });
 
-      if (!cancelled) {
+      if (!cancelled && mounted) {
         ScaffoldMessenger.of(context)
             .showSnackBar(SnackBar(content: Text('Download failed: $error')));
       }
@@ -254,32 +349,88 @@ class _MainWindowState extends State<MainWindow> {
         _activeDownloadIndex = null;
       }
     }
+
+    // Start the next queued download only after the current one finishes.
+    // Paused, stopped, and failed downloads do not advance the queue.
+    if (downloadCompleted && mounted) {
+      final nextIndex = _getNextQueuedDownload();
+
+      if (nextIndex != null) {
+        setState(() {
+          selectedFileIndex = nextIndex;
+        });
+
+        await _startSelectedDownload();
+      }
+    }
+  }
+
+  int? _getNextQueuedDownload() {
+    for (int i = 0; i < files.length; i++) {
+      if (files[i][2] == 'Queued') {
+        return i;
+      }
+    }
+
+    return null;
   }
 
   void _pauseSelectedDownload() {
     if (files.isEmpty) return;
 
-    setState(() {
-      files[selectedFileIndex][2] = 'Paused';
-      files[selectedFileIndex][3] = '—';
-      files[selectedFileIndex][4] = '—';
-    });
+    if (_isDownloadRunning &&
+        _downloadCancelToken != null &&
+        _activeDownloadIndex == selectedFileIndex) {
+      _isPauseRequested = true;
+
+      _downloadCancelToken!.cancel('Paused by user');
+      return;
+    }
+
+    if (files[selectedFileIndex][2] == 'Queued') {
+      setState(() {
+        files[selectedFileIndex][2] = 'Paused';
+      });
+    }
   }
 
-  void _stopSelectedDownload() {
+  Future<void> _stopSelectedDownload() async {
     if (files.isEmpty) return;
+
+    final file = files[selectedFileIndex];
+
+    if (file[2] == 'Finished') return;
 
     if (_isDownloadRunning &&
         _downloadCancelToken != null &&
         _activeDownloadIndex == selectedFileIndex) {
+      _isPauseRequested = false;
       _downloadCancelToken!.cancel('Stopped by user');
       return;
     }
 
+    final fileName = file[0].replaceAll(RegExp(r'[<>:"/\\|?*]'), '_');
+
+    final userProfile =
+        Platform.environment['USERPROFILE'] ?? Directory.current.path;
+
+    final savePath =
+        '$userProfile${Platform.pathSeparator}'
+        'Downloads${Platform.pathSeparator}$fileName';
+
+    final partialFile = File(savePath);
+
+    if (await partialFile.exists()) {
+      await partialFile.delete();
+    }
+
+    if (!mounted) return;
+
     setState(() {
-      files[selectedFileIndex][2] = 'Stopped';
-      files[selectedFileIndex][3] = '—';
-      files[selectedFileIndex][4] = '—';
+      file[2] = 'Stopped';
+      file[3] = '—';
+      file[4] = '—';
+      file[5] = '0';
     });
   }
 
@@ -297,8 +448,8 @@ class _MainWindowState extends State<MainWindow> {
     });
   }
 
-  Future<void> _showAddDownloadDialog() async {
-    String enteredUrl = '';
+  Future<void> _showAddDownloadDialog({String? initialUrl}) async {
+    String enteredUrl = initialUrl ?? '';
 
     final result = await showDialog<String>(
       context: context,
@@ -308,8 +459,9 @@ class _MainWindowState extends State<MainWindow> {
           title: const Text('Add New Download', style: TextStyle(fontSize: 16)),
           content: SizedBox(
             width: 400,
-            child: TextField(
+            child: TextFormField(
               autofocus: true,
+              initialValue: initialUrl ?? '',
               onChanged: (value) {
                 enteredUrl = value.trim();
               },
@@ -354,19 +506,51 @@ class _MainWindowState extends State<MainWindow> {
       return;
     }
 
-    final fileName =
+    final isDuplicate = files.any(
+      (file) => file.length >= 7 && file[6] == result,
+    );
+
+    if (isDuplicate) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('This download already exists in the list'),
+        ),
+      );
+      return;
+    }
+
+    String fileName =
         uri.pathSegments.isNotEmpty && uri.pathSegments.last.isNotEmpty
-        ? uri.pathSegments.last
+        ? Uri.decodeComponent(uri.pathSegments.last)
         : 'download_${DateTime.now().millisecondsSinceEpoch}';
 
-    setState(() {
-      files.add([fileName, 'Unknown', 'Queued', '—', '—', '0', result]);
+    String fileSize = 'Unknown';
 
-      selectedFileIndex = files.length - 1;
+    try {
+      final info = await _downloadService.getFileInfo(result);
+
+      fileName = info.fileName;
+      fileSize = info.formattedSize;
+    } catch (error) {
+      debugPrint('Could not retrieve file information: $error');
+    }
+
+    if (!mounted) return;
+    final shouldStartNow = !_isDownloadRunning;
+
+    setState(() {
+      files.add([fileName, fileSize, 'Queued', '—', '—', '0', result]);
+      if (shouldStartNow) {
+        selectedFileIndex = files.length - 1;
+      }
     });
 
     ScaffoldMessenger.of(context)
         .showSnackBar(const SnackBar(content: Text('Download added to queue')));
+
+    if (shouldStartNow) {
+      await _startSelectedDownload();
+    }
   }
 
   int get queuedCount {

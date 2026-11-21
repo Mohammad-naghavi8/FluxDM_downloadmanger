@@ -1,9 +1,68 @@
 import 'dart:io';
 
 import 'package:dio/dio.dart';
+import 'package:download_manager/features/downloads/models/download_file_info.dart';
 
 class DownloadService {
   final Dio _dio = Dio();
+
+  Future<DownloadFileInfo> getFileInfo(String url) async {
+    final uri = Uri.tryParse(url);
+
+    if (uri == null ||
+        !uri.hasAuthority ||
+        (uri.scheme != 'http' && uri.scheme != 'https')) {
+      throw ArgumentError('Invalid download URL');
+    }
+
+    final response = await _dio.head(
+      url,
+      options: Options(
+        followRedirects: true,
+        validateStatus: (status) =>
+            status != null && status >= 200 && status < 400,
+      ),
+    );
+
+    final contentLength = response.headers.value('content-length');
+    final fileSize = int.tryParse(contentLength ?? '');
+
+    final disposition = response.headers.value('content-disposition');
+
+    String fileName = uri.pathSegments.isNotEmpty
+        ? Uri.decodeComponent(uri.pathSegments.last)
+        : '';
+
+    if (disposition != null) {
+      final match = RegExp(
+        r'''filename\*?=(?:UTF-8''|")?([^";]+)''',
+        caseSensitive: false,
+      ).firstMatch(disposition);
+
+      if (match != null) {
+        fileName = Uri.decodeComponent(
+          match.group(1)!.replaceAll('"', '').trim(),
+        );
+      }
+    }
+
+    if (fileName.isEmpty) {
+      fileName = 'download_${DateTime.now().millisecondsSinceEpoch}';
+    }
+
+    final fileType = fileName.contains('.')
+        ? fileName.split('.').last.toUpperCase()
+        : 'Unknown';
+
+    final acceptRanges = response.headers.value('accept-ranges');
+
+    return DownloadFileInfo(
+      fileName: fileName,
+      fileSize: fileSize,
+      fileType: fileType,
+      supportsResume: acceptRanges?.toLowerCase() == 'bytes',
+    );
+  }
 
   Future<void> downloadFile({
     required String url,
@@ -71,6 +130,20 @@ class DownloadService {
     CancelToken? cancelToken,
   }) async {
     final file = File(savePath);
+
+    if (downloadedBytes <= 0) {
+      throw Exception('Invalid resume position');
+    }
+
+    if (!await file.exists()) {
+      throw Exception('Partial download file does not exist');
+    }
+
+    final actualBytes = await file.length();
+
+    if (actualBytes != downloadedBytes) {
+      throw Exception('Downloaded file size does not match resume position');
+    }
 
     final response = await _dio.get<ResponseBody>(
       url,
