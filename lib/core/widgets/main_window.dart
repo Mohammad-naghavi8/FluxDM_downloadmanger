@@ -475,12 +475,82 @@ class _MainWindowState extends State<MainWindow> with ClipboardListener {
     bool isLoadingInfo = false;
     String? infoError;
     int infoRequestId = 0;
+    bool initialFetchStarted = false;
+
+    String dialogPath = _downloadDirectory;
+
+    if (dialogPath.isEmpty) {
+      dialogPath = await _downloadPathService.getSavedPath();
+    }
+
+    if (!mounted) return;
+
+    Future<void> fetchFileInfo(
+      String url,
+      StateSetter setDialogState,
+      BuildContext dialogContext,
+    ) async {
+      final currentRequest = ++infoRequestId;
+      final uri = Uri.tryParse(url);
+
+      if (uri == null ||
+          !uri.hasAuthority ||
+          (uri.scheme != 'http' && uri.scheme != 'https')) {
+        setDialogState(() {
+          fileInfo = null;
+          isLoadingInfo = false;
+          infoError = null;
+        });
+        return;
+      }
+
+      setDialogState(() {
+        isLoadingInfo = true;
+        fileInfo = null;
+        infoError = null;
+      });
+
+      try {
+        final info = await _downloadService.getFileInfo(url);
+
+        if (!dialogContext.mounted || currentRequest != infoRequestId) {
+          return;
+        }
+
+        setDialogState(() {
+          fileInfo = info;
+          isLoadingInfo = false;
+        });
+      } catch (error) {
+        if (!dialogContext.mounted || currentRequest != infoRequestId) {
+          return;
+        }
+
+        setDialogState(() {
+          fileInfo = null;
+          isLoadingInfo = false;
+          infoError = 'Could not retrieve file information';
+        });
+      }
+    }
 
     final result = await showDialog<String>(
       context: context,
       builder: (dialogContext) {
         return StatefulBuilder(
           builder: (context, setDialogState) {
+            if (initialUrl != null &&
+                initialUrl.isNotEmpty &&
+                !initialFetchStarted) {
+              initialFetchStarted = true;
+
+              WidgetsBinding.instance.addPostFrameCallback((_) {
+                if (dialogContext.mounted) {
+                  fetchFileInfo(initialUrl, setDialogState, dialogContext);
+                }
+              });
+            }
+
             return AlertDialog(
               backgroundColor: AppColors.surface,
               title: const Text(
@@ -488,119 +558,129 @@ class _MainWindowState extends State<MainWindow> with ClipboardListener {
                 style: TextStyle(fontSize: 16),
               ),
               content: SizedBox(
-                width: 400,
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    TextFormField(
-                      autofocus: true,
-                      initialValue: initialUrl ?? '',
-                      onChanged: (value) async {
-                        enteredUrl = value.trim();
+                width: 420,
+                child: SingleChildScrollView(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      TextFormField(
+                        autofocus: true,
+                        initialValue: initialUrl ?? '',
+                        onChanged: (value) {
+                          enteredUrl = value.trim();
 
-                        final currentRequest = ++infoRequestId;
-                        final uri = Uri.tryParse(enteredUrl);
-
-                        if (uri == null ||
-                            !uri.hasAuthority ||
-                            (uri.scheme != 'http' && uri.scheme != 'https')) {
-                          setDialogState(() {
-                            fileInfo = null;
-                            isLoadingInfo = false;
-                            infoError = null;
-                          });
-                          return;
-                        }
-
-                        setDialogState(() {
-                          isLoadingInfo = true;
-                          fileInfo = null;
-                          infoError = null;
-                        });
-
-                        try {
-                          final info = await _downloadService.getFileInfo(
+                          fetchFileInfo(
                             enteredUrl,
+                            setDialogState,
+                            dialogContext,
                           );
-
-                          if (!dialogContext.mounted ||
-                              currentRequest != infoRequestId) {
-                            return;
-                          }
-
-                          setDialogState(() {
-                            fileInfo = info;
-                            isLoadingInfo = false;
-                          });
-                        } catch (error) {
-                          if (!dialogContext.mounted ||
-                              currentRequest != infoRequestId) {
-                            return;
-                          }
-
-                          setDialogState(() {
-                            fileInfo = null;
-                            isLoadingInfo = false;
-                            infoError = 'Could not retrieve file information';
-                          });
-                        }
-                      },
-                      decoration: const InputDecoration(
-                        hintText: 'https://example.com/file.zip',
-                        labelText: 'Download URL',
-                        prefixIcon: Icon(Icons.link),
-                      ),
-                    ),
-
-                    const SizedBox(height: 16),
-
-                    if (isLoadingInfo)
-                      const Row(
-                        children: [
-                          SizedBox(
-                            width: 18,
-                            height: 18,
-                            child: CircularProgressIndicator(strokeWidth: 2),
-                          ),
-                          SizedBox(width: 10),
-                          Text('Getting file information...'),
-                        ],
+                        },
+                        decoration: const InputDecoration(
+                          hintText: 'https://example.com/file.zip',
+                          labelText: 'Download URL',
+                          prefixIcon: Icon(Icons.link),
+                        ),
                       ),
 
-                    if (fileInfo != null) ...[
+                      const SizedBox(height: 18),
+
+                      if (isLoadingInfo)
+                        const Row(
+                          children: [
+                            SizedBox(
+                              width: 18,
+                              height: 18,
+                              child: CircularProgressIndicator(strokeWidth: 2),
+                            ),
+                            SizedBox(width: 10),
+                            Text('Getting file information...'),
+                          ],
+                        ),
+
+                      if (fileInfo != null) ...[
+                        const Text(
+                          'File Information',
+                          style: TextStyle(fontWeight: FontWeight.bold),
+                        ),
+                        const SizedBox(height: 10),
+                        _buildDetailRow('File name', fileInfo!.fileName),
+                        _buildDetailRow('File type', fileInfo!.fileType),
+                        _buildDetailRow('File size', fileInfo!.formattedSize),
+                        _buildDetailRow(
+                          'Resume',
+                          fileInfo!.supportsResume
+                              ? 'Supported'
+                              : 'Not supported',
+                        ),
+                      ],
+
+                      if (infoError != null) ...[
+                        const SizedBox(height: 8),
+                        Text(
+                          infoError!,
+                          style: const TextStyle(color: Colors.red),
+                        ),
+                      ],
+
+                      const SizedBox(height: 20),
+
                       const Text(
-                        'File Information',
+                        'Save location',
                         style: TextStyle(fontWeight: FontWeight.bold),
                       ),
+
                       const SizedBox(height: 8),
-                      _buildDetailRow('File name', fileInfo!.fileName),
-                      _buildDetailRow('File type', fileInfo!.fileType),
-                      _buildDetailRow('File size', fileInfo!.formattedSize),
-                      _buildDetailRow(
-                        'Resume',
-                        fileInfo!.supportsResume
-                            ? 'Supported'
-                            : 'Not supported',
+
+                      Text(dialogPath, style: const TextStyle(fontSize: 12)),
+
+                      const SizedBox(height: 10),
+
+                      OutlinedButton.icon(
+                        onPressed: () async {
+                          final changed = await _downloadPathService
+                              .chooseDirectory();
+
+                          if (!changed || !dialogContext.mounted) {
+                            return;
+                          }
+
+                          final newPath = await _downloadPathService
+                              .getSavedPath();
+
+                          if (!dialogContext.mounted) return;
+
+                          setDialogState(() {
+                            dialogPath = newPath;
+                          });
+
+                          if (mounted) {
+                            setState(() {
+                              _downloadDirectory = newPath;
+                            });
+                          }
+                        },
+                        icon: const Icon(Icons.folder_open),
+                        label: const Text('Browse'),
                       ),
                     ],
-
-                    if (infoError != null)
-                      Text(
-                        infoError!,
-                        style: const TextStyle(color: Colors.red),
-                      ),
-                  ],
+                  ),
                 ),
               ),
               actions: [
                 TextButton(
-                  onPressed: () => Navigator.pop(dialogContext),
+                  onPressed: () {
+                    Navigator.pop(dialogContext);
+                  },
                   child: const Text('Cancel'),
                 ),
                 ElevatedButton(
-                  onPressed: () => Navigator.pop(dialogContext, enteredUrl),
-                  child: const Text('Continue'),
+                  onPressed: enteredUrl.isEmpty || isLoadingInfo
+                      ? null
+                      : () {
+                          Navigator.pop(dialogContext, enteredUrl);
+                        },
+                  child: const Text('Start Download'),
                 ),
               ],
             );
@@ -636,119 +716,13 @@ class _MainWindowState extends State<MainWindow> with ClipboardListener {
       return;
     }
 
-    String fileName =
-        uri.pathSegments.isNotEmpty && uri.pathSegments.last.isNotEmpty
-        ? Uri.decodeComponent(uri.pathSegments.last)
-        : 'download_${DateTime.now().millisecondsSinceEpoch}';
+    final fileName =
+        fileInfo?.fileName ??
+        (uri.pathSegments.isNotEmpty && uri.pathSegments.last.isNotEmpty
+            ? Uri.decodeComponent(uri.pathSegments.last)
+            : 'download_${DateTime.now().millisecondsSinceEpoch}');
 
-    String fileSize = 'Unknown';
-    String fileType = 'Unknown';
-    String resumeSupport = 'Unknown';
-
-    try {
-      final info = await _downloadService.getFileInfo(result);
-
-      fileName = info.fileName;
-      fileSize = info.formattedSize;
-      fileType = info.fileType;
-      resumeSupport = info.supportsResume ? 'Supported' : 'Not supported';
-    } catch (error) {
-      debugPrint('Could not retrieve file information: $error');
-
-      final extension = fileName.contains('.')
-          ? fileName.split('.').last.toUpperCase()
-          : 'Unknown';
-
-      fileType = extension;
-    }
-
-    if (!mounted) return;
-
-    String dialogPath = _downloadDirectory;
-
-    if (dialogPath.isEmpty) {
-      dialogPath = await _downloadPathService.getSavedPath();
-    }
-
-    if (!mounted) return;
-
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (dialogContext) {
-        return StatefulBuilder(
-          builder: (context, setDialogState) {
-            return AlertDialog(
-              backgroundColor: AppColors.surface,
-              title: const Text('Download Details'),
-              content: SizedBox(
-                width: 420,
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    _buildDetailRow('File name', fileName),
-                    _buildDetailRow('File type', fileType),
-                    _buildDetailRow('File size', fileSize),
-                    _buildDetailRow('Resume', resumeSupport),
-
-                    const SizedBox(height: 20),
-
-                    const Text(
-                      'Save location',
-                      style: TextStyle(fontWeight: FontWeight.bold),
-                    ),
-
-                    const SizedBox(height: 8),
-
-                    Text(dialogPath, style: const TextStyle(fontSize: 12)),
-
-                    const SizedBox(height: 12),
-
-                    OutlinedButton.icon(
-                      onPressed: () async {
-                        final changed = await _downloadPathService
-                            .chooseDirectory();
-
-                        if (!changed || !dialogContext.mounted) return;
-
-                        final newPath = await _downloadPathService
-                            .getSavedPath();
-
-                        if (!dialogContext.mounted) return;
-
-                        setDialogState(() {
-                          dialogPath = newPath;
-                        });
-
-                        if (mounted) {
-                          setState(() {
-                            _downloadDirectory = newPath;
-                          });
-                        }
-                      },
-                      icon: const Icon(Icons.folder_open),
-                      label: const Text('Browse'),
-                    ),
-                  ],
-                ),
-              ),
-              actions: [
-                TextButton(
-                  onPressed: () => Navigator.pop(dialogContext, false),
-                  child: const Text('Cancel'),
-                ),
-                ElevatedButton(
-                  onPressed: () => Navigator.pop(dialogContext, true),
-                  child: const Text('Start Download'),
-                ),
-              ],
-            );
-          },
-        );
-      },
-    );
-
-    if (!mounted || confirmed != true) return;
+    final fileSize = fileInfo?.formattedSize ?? 'Unknown';
 
     final shouldStartNow = !_isDownloadRunning;
 
