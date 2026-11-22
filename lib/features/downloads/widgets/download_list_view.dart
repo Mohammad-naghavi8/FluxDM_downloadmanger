@@ -1,3 +1,4 @@
+import 'package:download_manager/core/localization/app_strings.dart';
 import 'package:download_manager/core/theme/app_colors.dart';
 import 'package:download_manager/features/downloads/models/download_entry.dart';
 import 'package:download_manager/features/downloads/models/download_schedule_config.dart';
@@ -33,23 +34,26 @@ class DownloadListView extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final s = AppStrings.instance;
     final footerParts = <String>[
-      '$totalCount ${totalCount == 1 ? 'file' : 'files'}',
-      'Active: $activeCount/$maxConcurrent',
-      'Segments: ${scheduleConfig.segmentsPerDownload}',
+      '$totalCount ${s.t(totalCount == 1 ? 'file' : 'files')}',
+      '${s.t('Active')}: $activeCount/$maxConcurrent',
+      '${s.t('Segments')}: ${scheduleConfig.segmentsPerDownload}',
     ];
     if (scheduleConfig.speedLimitEnabled && scheduleConfig.speedLimitKBps > 0) {
-      footerParts.add('Speed limit: ${scheduleConfig.speedLimitKBps} KB/s');
+      footerParts.add(
+        '${s.t('Speed limit')}: ${scheduleConfig.speedLimitKBps} KB/s',
+      );
     }
     if (scheduleConfig.autoStartQueueEnabled &&
         scheduleConfig.queueStartTime != null) {
       footerParts.add(
-        'Auto-start: ${DownloadScheduleConfig.formatScheduleDateTime(scheduleConfig.queueStartTime)}',
+        '${s.t('Auto-start')}: ${DownloadScheduleConfig.formatScheduleDateTime(scheduleConfig.queueStartTime)}',
       );
     }
     if (scheduleConfig.autoStopEnabled && scheduleConfig.queueStopTime != null) {
       footerParts.add(
-        'Auto-pause: ${DownloadScheduleConfig.formatScheduleDateTime(scheduleConfig.queueStopTime)}',
+        '${s.t('Auto-pause')}: ${DownloadScheduleConfig.formatScheduleDateTime(scheduleConfig.queueStopTime)}',
       );
     }
 
@@ -62,7 +66,10 @@ class DownloadListView extends StatelessWidget {
             children: [
               Expanded(
                 child: Text(
-                  selectedCategory.replaceAll('::', ' › '),
+                  selectedCategory
+                      .split('::')
+                      .map((part) => s.t(part))
+                      .join(' › '),
                   style: const TextStyle(
                     fontSize: 16,
                     fontWeight: FontWeight.bold,
@@ -74,7 +81,7 @@ class DownloadListView extends StatelessWidget {
                 child: TextField(
                   onChanged: onSearchChanged,
                   decoration: InputDecoration(
-                    hintText: 'Search files',
+                    hintText: s.t('Search files'),
                     prefixIcon: const Icon(Icons.search),
                     border: OutlineInputBorder(
                       borderRadius: BorderRadius.circular(5),
@@ -85,32 +92,36 @@ class DownloadListView extends StatelessWidget {
             ],
           ),
           const SizedBox(height: 20),
-          const _TableHeader(),
+          // Non-const so table headers rebuild immediately on language switch.
+          // ignore: prefer_const_constructors
+          _TableHeader(),
           const Divider(color: AppColors.border),
           Expanded(
             child: files.isEmpty
-                ? const Center(
+                ? Center(
                     child: Column(
                       mainAxisSize: MainAxisSize.min,
                       children: [
-                        Icon(
+                        const Icon(
                           Icons.download_outlined,
                           size: 40,
                           color: AppColors.textSecondary,
                         ),
-                        SizedBox(height: 12),
+                        const SizedBox(height: 12),
                         Text(
-                          'No downloads yet',
-                          style: TextStyle(
+                          s.t('No downloads yet'),
+                          style: const TextStyle(
                             color: AppColors.textPrimary,
                             fontSize: 14,
                             fontWeight: FontWeight.w500,
                           ),
                         ),
-                        SizedBox(height: 6),
+                        const SizedBox(height: 6),
                         Text(
-                          'Click + or copy a download URL to add a download',
-                          style: TextStyle(
+                          s.t(
+                            'Click + or copy a download URL to add a download',
+                          ),
+                          style: const TextStyle(
                             color: AppColors.textSecondary,
                             fontSize: 12,
                           ),
@@ -130,12 +141,28 @@ class DownloadListView extends StatelessWidget {
                   ),
           ),
           const SizedBox(height: 6),
-          Text(
-            footerParts.join('  •  '),
-            style: const TextStyle(
-              color: AppColors.textSecondary,
-              fontSize: 12,
-            ),
+          Wrap(
+            spacing: 12,
+            runSpacing: 4,
+            children: [
+              for (int i = 0; i < footerParts.length; i++) ...[
+                Text(
+                  footerParts[i],
+                  style: const TextStyle(
+                    color: AppColors.textSecondary,
+                    fontSize: 12,
+                  ),
+                ),
+                if (i < footerParts.length - 1)
+                  const Text(
+                    '•',
+                    style: TextStyle(
+                      color: AppColors.textSecondary,
+                      fontSize: 12,
+                    ),
+                  ),
+              ],
+            ],
           ),
         ],
       ),
@@ -204,7 +231,7 @@ class DownloadListView extends StatelessWidget {
             Expanded(
               flex: 2,
               child: Text(
-                status,
+                AppStrings.instance.t(status),
                 style: TextStyle(fontSize: 11, color: progressColor),
               ),
             ),
@@ -302,14 +329,15 @@ class _TableHeader extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return const Row(
+    final s = AppStrings.instance;
+    return Row(
       children: [
-        Expanded(flex: 5, child: Text('File Name')),
-        Expanded(flex: 1, child: Text('Size')),
-        Expanded(flex: 2, child: Text('Status')),
-        Expanded(flex: 1, child: Text('Speed')),
-        Expanded(flex: 1, child: Text('Time Left')),
-        Expanded(flex: 2, child: Text('Progress')),
+        Expanded(flex: 5, child: Text(s.t('File Name'))),
+        Expanded(flex: 1, child: Text(s.t('Size'))),
+        Expanded(flex: 2, child: Text(s.t('Status'))),
+        Expanded(flex: 1, child: Text(s.t('Speed'))),
+        Expanded(flex: 1, child: Text(s.t('Time Left'))),
+        Expanded(flex: 2, child: Text(s.t('Progress'))),
       ],
     );
   }

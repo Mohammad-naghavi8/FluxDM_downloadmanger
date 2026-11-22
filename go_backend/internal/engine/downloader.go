@@ -36,11 +36,19 @@ var (
 		"png": true, "gif": true, "webp": true, "svg": true, "torrent": true,
 	}
 	partExtRegex = regexp.MustCompile(`^(?:part\d+|r\d{2}|\d{3})$`)
+	ioBufPool    = sync.Pool{
+		New: func() any {
+			b := make([]byte, 64*1024)
+			return &b
+		},
+	}
 )
 
 type Engine struct {
 	dialer *SmartDialer
 	client *http.Client
+	cfgMu  sync.RWMutex
+	cfg    EngineConfig
 }
 
 func NewEngine() *Engine {
@@ -141,7 +149,7 @@ func (e *Engine) Probe(ctx context.Context, rawURL, username, password string) (
 	if err != nil {
 		return FileInfo{}, err
 	}
-	applyCommonHeaders(req, username, password)
+	e.applyConfiguredHeaders(req, username, password)
 
 	resp, err := e.client.Do(req)
 	if err != nil {
@@ -157,7 +165,7 @@ func (e *Engine) Probe(ctx context.Context, rawURL, username, password string) (
 		if gErr != nil {
 			return FileInfo{}, gErr
 		}
-		applyCommonHeaders(getReq, username, password)
+		e.applyConfiguredHeaders(getReq, username, password)
 		getReq.Header.Set("Range", "bytes=0-0")
 		resp, err = e.client.Do(getReq)
 		if err != nil {
@@ -343,6 +351,7 @@ func (e *Engine) Download(
 	}
 
 	if req.Segmented && req.TotalBytes > 0 && req.ConnectionCount > 1 {
+		req.ConnectionCount = e.effectiveConnectionCount(req.URL, req.ConnectionCount)
 		return e.downloadSegmented(ctx, req, limiter, emit)
 	}
 	return e.downloadSingle(ctx, req, limiter, emit)
@@ -382,7 +391,7 @@ func (e *Engine) downloadSingle(
 		if err != nil {
 			return err
 		}
-		applyCommonHeaders(httpReq, req.Username, req.Password)
+		e.applyConfiguredHeaders(httpReq, req.Username, req.Password)
 		if isResuming {
 			httpReq.Header.Set("Range", fmt.Sprintf("bytes=%d-", received))
 		}
@@ -439,7 +448,8 @@ func (e *Engine) downloadSingle(
 			return fileErr
 		}
 
-		buf := make([]byte, 64*1024)
+		bufPtr := ioBufPool.Get().(*[]byte)
+		buf := *bufPtr
 		var streamErr error
 		for {
 			n, rErr := resp.Body.Read(buf)
@@ -469,6 +479,7 @@ func (e *Engine) downloadSingle(
 			}
 		}
 
+		ioBufPool.Put(bufPtr)
 		_ = file.Sync()
 		_ = file.Close()
 		_ = resp.Body.Close()
@@ -541,7 +552,7 @@ func (e *Engine) downloadSegmented(
 	// Resolve redirects once so all N goroutines hit the resolved CDN edge directly
 	effectiveURL := req.URL
 	if headReq, err := http.NewRequestWithContext(ctx, http.MethodHead, req.URL, nil); err == nil {
-		applyCommonHeaders(headReq, req.Username, req.Password)
+		e.applyConfiguredHeaders(headReq, req.Username, req.Password)
 		if headResp, hErr := e.client.Do(headReq); hErr == nil {
 			_ = headResp.Body.Close()
 			if headResp.Request != nil && headResp.Request.URL != nil {
@@ -695,7 +706,7 @@ func (e *Engine) downloadSegmented(
 					setErr(err)
 					return
 				}
-				applyCommonHeaders(httpReq, req.Username, req.Password)
+				e.applyConfiguredHeaders(httpReq, req.Username, req.Password)
 				httpReq.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", rangeStart, rangeEnd))
 
 				resp, err := e.client.Do(httpReq)
@@ -752,7 +763,8 @@ func (e *Engine) downloadSegmented(
 					return
 				}
 
-				buf := make([]byte, 64*1024)
+				bufPtr := ioBufPool.Get().(*[]byte)
+				buf := *bufPtr
 				var readErr error
 				for {
 					n, rErr := resp.Body.Read(buf)
@@ -793,6 +805,7 @@ func (e *Engine) downloadSegmented(
 					}
 				}
 
+				ioBufPool.Put(bufPtr)
 				_ = file.Sync()
 				_ = file.Close()
 				_ = resp.Body.Close()

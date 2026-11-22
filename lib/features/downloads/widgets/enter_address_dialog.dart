@@ -1,3 +1,4 @@
+import 'package:download_manager/core/localization/app_strings.dart';
 import 'package:download_manager/core/theme/app_colors.dart';
 import 'package:download_manager/features/downloads/utils/download_link_helper.dart';
 import 'package:material_ui/material_ui.dart';
@@ -217,12 +218,12 @@ class _EnterAddressDialogState extends State<EnterAddressDialog> {
             size: 17,
           ),
           const SizedBox(width: 8),
-          const Expanded(
+          Expanded(
             child: Text(
-              'Enter new address to download',
+              AppStrings.instance.t('Enter new address to download'),
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
-              style: TextStyle(
+              style: const TextStyle(
                 color: AppColors.textPrimary,
                 fontSize: 12.5,
                 fontWeight: FontWeight.w500,
@@ -230,7 +231,7 @@ class _EnterAddressDialogState extends State<EnterAddressDialog> {
             ),
           ),
           IconButton(
-            tooltip: 'Close',
+            tooltip: AppStrings.instance.t('Close'),
             onPressed: () => Navigator.pop(context),
             iconSize: 16,
             padding: EdgeInsets.zero,
@@ -250,13 +251,14 @@ class _EnterAddressDialogState extends State<EnterAddressDialog> {
   }
 
   Widget _buildAddressRow() {
+    final s = AppStrings.instance;
     return Row(
       children: [
-        const SizedBox(
-          width: 58,
+        SizedBox(
+          width: 64,
           child: Text(
-            'Address',
-            style: TextStyle(color: AppColors.textPrimary, fontSize: 12.5),
+            s.t('Address'),
+            style: const TextStyle(color: AppColors.textPrimary, fontSize: 12.5),
           ),
         ),
         Expanded(
@@ -378,7 +380,10 @@ class _EnterAddressDialogState extends State<EnterAddressDialog> {
           ),
           child: Row(
             children: [
-              Text('Login', style: TextStyle(color: labelColor, fontSize: 12)),
+              Text(
+                AppStrings.instance.t('Login'),
+                style: TextStyle(color: labelColor, fontSize: 12),
+              ),
               const SizedBox(width: 8),
               Expanded(
                 child: _buildAuthInput(
@@ -388,7 +393,7 @@ class _EnterAddressDialogState extends State<EnterAddressDialog> {
               ),
               const SizedBox(width: 14),
               Text(
-                'Password',
+                AppStrings.instance.t('Password'),
                 style: TextStyle(color: labelColor, fontSize: 12),
               ),
               const SizedBox(width: 8),
@@ -434,9 +439,9 @@ class _EnterAddressDialogState extends State<EnterAddressDialog> {
                     ),
                   ),
                   const SizedBox(width: 6),
-                  const Text(
-                    'Use authorization',
-                    style: TextStyle(
+                  Text(
+                    AppStrings.instance.t('Use authorization'),
+                    style: const TextStyle(
                       color: AppColors.textPrimary,
                       fontSize: 12,
                     ),
@@ -502,7 +507,7 @@ class _EnterAddressDialogState extends State<EnterAddressDialog> {
             fontWeight: FontWeight.w500,
           ),
         ),
-        child: Text(label),
+        child: Text(AppStrings.instance.t(label)),
       ),
     );
   }

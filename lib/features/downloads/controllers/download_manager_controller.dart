@@ -8,8 +8,11 @@ import 'package:download_manager/features/downloads/models/download_progress_sta
 import 'package:download_manager/features/downloads/models/download_schedule_config.dart';
 import 'package:download_manager/features/downloads/services/download_path_service.dart';
 import 'package:download_manager/features/downloads/services/download_service.dart';
+import 'package:download_manager/features/downloads/services/go_engine_client.dart';
+import 'package:download_manager/features/downloads/services/go_engine_process.dart';
 import 'package:download_manager/features/downloads/services/speed_limiter.dart';
 import 'package:download_manager/features/downloads/utils/download_link_helper.dart';
+import 'package:download_manager/features/torrents/models/torrent_models.dart';
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -52,23 +55,39 @@ class DownloadManagerController extends ChangeNotifier {
   final DownloadService Function() _serviceFactory;
   final DownloadPathService downloadPathService;
   final void Function(String message)? onMessage;
+  final void Function(DownloadEntry entry)? onDownloadCompleted;
 
   DownloadManagerController({
     DownloadService? downloadService,
     DownloadService Function()? serviceFactory,
     DownloadPathService? downloadPathService,
     this.onMessage,
+    this.onDownloadCompleted,
   }) : downloadService = downloadService ?? DownloadService(),
        _serviceFactory = serviceFactory ?? (() => DownloadService()),
-       downloadPathService = downloadPathService ?? DownloadPathService() {
-    _schedulerTimer = Timer.periodic(
-      const Duration(seconds: 1),
-      (_) => checkSchedules(),
-    );
+       downloadPathService = downloadPathService ?? DownloadPathService();
+
+  bool get _needsSchedulerTimer =>
+      scheduleConfig.autoStartQueueEnabled ||
+      scheduleConfig.autoStopEnabled ||
+      files.any((entry) => entry.isScheduled && entry.scheduledAt != null);
+
+  void _syncSchedulerTimer() {
+    if (_disposed) return;
+    if (_needsSchedulerTimer) {
+      _schedulerTimer ??= Timer.periodic(
+        const Duration(seconds: 1),
+        (_) => checkSchedules(),
+      );
+    } else {
+      _schedulerTimer?.cancel();
+      _schedulerTimer = null;
+    }
   }
 
   String selectedCategory = 'All Downloads';
   String searchQuery = '';
+  String sortBy = 'order';
   String? selectedFileId;
   String downloadDirectory = '';
   DownloadScheduleConfig scheduleConfig = const DownloadScheduleConfig();
@@ -89,6 +108,8 @@ class DownloadManagerController extends ChangeNotifier {
 
   int get activeDownloadCount => _activeSessions.length;
 
+  bool get hasCompletedDownloads => files.any((entry) => entry.isFinished);
+
   int get queuedCount =>
       files.where((entry) => entry.isQueued || entry.isScheduled).length;
 
@@ -105,14 +126,41 @@ class DownloadManagerController extends ChangeNotifier {
 
   List<DownloadEntry> get visibleFiles {
     final query = searchQuery.trim().toLowerCase();
-    return files.where((entry) {
+    final filtered = files.where((entry) {
       if (!_matchesCategory(entry, selectedCategory)) {
         return false;
       }
       if (query.isEmpty) return true;
       return entry.fileName.toLowerCase().contains(query) ||
           entry.url.toLowerCase().contains(query);
-    }).toList(growable: false);
+    }).toList();
+
+    switch (sortBy) {
+      case 'name':
+        filtered.sort(
+          (a, b) =>
+              a.fileName.toLowerCase().compareTo(b.fileName.toLowerCase()),
+        );
+      case 'size':
+        filtered.sort(
+          (a, b) => (b.totalBytes ?? 0).compareTo(a.totalBytes ?? 0),
+        );
+      case 'status':
+        filtered.sort((a, b) => a.status.compareTo(b.status));
+      case 'timeLeft':
+        filtered.sort((a, b) => a.timeLeftText.compareTo(b.timeLeftText));
+      case 'speed':
+        filtered.sort((a, b) => b.speedText.compareTo(a.speedText));
+      default:
+        break;
+    }
+    return filtered;
+  }
+
+  void setSortBy(String mode) {
+    if (sortBy == mode) return;
+    sortBy = mode;
+    _notify();
   }
 
   int categoryCount(String categoryKey) {
@@ -263,6 +311,7 @@ class DownloadManagerController extends ChangeNotifier {
     }
 
     _notify();
+    _syncSchedulerTimer();
 
     try {
       final prefs = await SharedPreferences.getInstance();
@@ -571,6 +620,7 @@ class DownloadManagerController extends ChangeNotifier {
     _notify();
 
     if (isScheduled) {
+      _syncSchedulerTimer();
       _emitMessage(
         'Scheduled "${entry.fileName}" for ${DownloadScheduleConfig.formatScheduleDateTime(scheduledAt)}',
       );
@@ -589,6 +639,51 @@ class DownloadManagerController extends ChangeNotifier {
       _emitMessage('Download added to queue');
     }
 
+    return entry;
+  }
+
+  DownloadEntry? addTorrentDownload({
+    required TorrentMetadata metadata,
+    required String saveDirectory,
+    required bool downloadInOrder,
+    required bool startNow,
+  }) {
+    final isDuplicate = files.any((entry) => entry.url == metadata.source);
+    if (isDuplicate) {
+      _emitMessage('This torrent already exists in the list');
+      return null;
+    }
+
+    final totalBytes = metadata.selectedBytes > 0
+        ? metadata.selectedBytes
+        : metadata.totalBytes;
+    final savePath =
+        '$saveDirectory${Platform.pathSeparator}${metadata.name}';
+
+    final entry = DownloadEntry(
+      id: _nextId(),
+      fileName: metadata.name,
+      url: metadata.source,
+      savePath: savePath,
+      category: 'Torrents',
+      sizeText: totalBytes > 0
+          ? DownloadProgressState.formatBytes(totalBytes)
+          : 'Unknown',
+      status: startNow ? 'Queued' : 'Paused',
+      totalBytes: totalBytes > 0 ? totalBytes : null,
+      supportsResume: true,
+    );
+
+    files.add(entry);
+    selectedFileId = entry.id;
+    _notify();
+
+    final orderNote = downloadInOrder ? ' (sequential)' : '';
+    _emitMessage(
+      startNow
+          ? 'Torrent added: ${metadata.name}$orderNote'
+          : 'Torrent saved for later: ${metadata.name}',
+    );
     return entry;
   }
 
@@ -612,6 +707,7 @@ class DownloadManagerController extends ChangeNotifier {
     entry.speedText = '—';
     entry.timeLeftText = 'At ${entry.formattedScheduleTime}';
     _notify();
+    _syncSchedulerTimer();
 
     _emitMessage(
       'Scheduled "${entry.fileName}" for ${DownloadScheduleConfig.formatScheduleDateTime(scheduledAt)}',
@@ -667,6 +763,8 @@ class DownloadManagerController extends ChangeNotifier {
         _emitMessage('Active downloads paused by schedule');
       }
     }
+
+    _syncSchedulerTimer();
   }
 
   void startQueue() {
@@ -1159,6 +1257,7 @@ class DownloadManagerController extends ChangeNotifier {
 
       downloadCompleted = true;
       _emitMessage('Download completed: $displayFileName');
+      onDownloadCompleted?.call(entry);
     } catch (error) {
       if (_disposed) return;
 
@@ -1301,6 +1400,76 @@ class DownloadManagerController extends ChangeNotifier {
     await stopDownloadById(entry.id);
   }
 
+  Future<void> stopAllDownloads() async {
+    if (GoEngineProcess.instance.isRunning) {
+      unawaited(GoEngineClient().stopAllDownloads().catchError((_) {}));
+    }
+
+    final activeIds = _activeSessions.keys.toList();
+    for (final id in activeIds) {
+      final session = _activeSessions[id];
+      if (session != null) {
+        session.isPauseRequested = false;
+        session.cancelToken.cancel('Stopped by user');
+      }
+    }
+
+    int stoppedQueued = 0;
+    for (final entry in files) {
+      if (entry.isQueued || entry.isScheduled) {
+        entry.scheduledAt = null;
+        entry.status = 'Stopped';
+        entry.speedText = '—';
+        entry.timeLeftText = '—';
+        stoppedQueued++;
+      }
+    }
+
+    if (stoppedQueued > 0) {
+      _notify();
+      _syncSchedulerTimer();
+    }
+
+    if (activeIds.isNotEmpty || stoppedQueued > 0) {
+      _emitMessage('Stopped all downloads');
+    } else {
+      _emitMessage('No active downloads to stop');
+    }
+  }
+
+  void deleteCompletedDownloads() {
+    final completedIds = files
+        .where((e) => e.isFinished)
+        .map((e) => e.id)
+        .toSet();
+    if (completedIds.isEmpty) {
+      _emitMessage('No completed downloads to delete');
+      return;
+    }
+
+    files.removeWhere((e) => completedIds.contains(e.id));
+    for (final id in completedIds) {
+      _progressById.remove(id);
+      _entrySpeedLimitBytesById.remove(id);
+    }
+
+    if (_progressWindowEntryId != null &&
+        completedIds.contains(_progressWindowEntryId)) {
+      isProgressWindowVisible = false;
+      _progressWindowEntryId = null;
+      progressNotifier.value = null;
+    }
+
+    if (selectedFileId != null && completedIds.contains(selectedFileId)) {
+      selectedFileId = files.isNotEmpty ? files.first.id : null;
+    }
+
+    _notify();
+    _emitMessage(
+      'Deleted ${completedIds.length} completed download${completedIds.length == 1 ? '' : 's'}',
+    );
+  }
+
   Future<void> stopDownloadById(String entryId) async {
     final entry = findEntryById(entryId);
     if (entry == null || entry.isFinished) return;
@@ -1367,6 +1536,46 @@ class DownloadManagerController extends ChangeNotifier {
     final entry = selectedEntry;
     if (entry == null) return;
     await deleteDownloadById(entry.id);
+  }
+
+  Future<void> deleteSelectedWithFiles() async {
+    final entry = selectedEntry;
+    if (entry == null) return;
+    final path = entry.savePath;
+    await deleteDownloadById(entry.id);
+    if (path.isNotEmpty) {
+      final f = File(path);
+      if (await f.exists()) {
+        try {
+          await f.delete();
+        } catch (_) {}
+      }
+      await downloadService.cleanupPartialFiles(path);
+    }
+  }
+
+  Future<void> redownloadSelected() async {
+    final entry = selectedEntry;
+    if (entry == null) return;
+    if (_activeSessions.containsKey(entry.id)) {
+      await stopDownloadById(entry.id);
+    }
+    if (entry.savePath.isNotEmpty) {
+      await downloadService.cleanupPartialFiles(entry.savePath);
+      final f = File(entry.savePath);
+      if (await f.exists()) {
+        try {
+          await f.delete();
+        } catch (_) {}
+      }
+    }
+    entry.status = 'Queued';
+    entry.downloadedBytes = 0;
+    entry.progressPercent = 0;
+    entry.speedText = '—';
+    entry.timeLeftText = '—';
+    _notify();
+    await startDownloadById(entry.id);
   }
 
   Future<void> deleteDownloadById(String entryId) async {

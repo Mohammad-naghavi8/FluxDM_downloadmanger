@@ -1,4 +1,5 @@
-import 'package:download_manager/core/theme/app_colors.dart';
+import 'package:download_manager/core/localization/app_strings.dart';
+import 'package:download_manager/core/theme/app_theme_controller.dart';
 import 'package:material_ui/material_ui.dart';
 
 class _TreeNodeSpec {
@@ -127,19 +128,21 @@ class _DownloadSidebarState extends State<DownloadSidebar> {
   @override
   Widget build(BuildContext context) {
     final tree = _buildTree();
+    final palette = AppThemeController.instance.palette;
+    final isDark = palette.brightness == Brightness.dark;
 
     return Container(
       width: 214,
-      decoration: const BoxDecoration(
-        color: Color(0xFF1A1A1A),
+      decoration: BoxDecoration(
+        color: palette.sidebar,
         border: Border(
-          right: BorderSide(color: Color(0xFF333333), width: 1),
+          right: BorderSide(color: palette.border, width: 1),
         ),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          _buildHeader(),
+          _buildHeader(palette, isDark),
           Expanded(
             child: ListView(
               padding: const EdgeInsets.symmetric(vertical: 4),
@@ -161,23 +164,24 @@ class _DownloadSidebarState extends State<DownloadSidebar> {
     );
   }
 
-  Widget _buildHeader() {
+  Widget _buildHeader(FluxThemePalette palette, bool isDark) {
+    final s = AppStrings.instance;
     return Container(
       height: 26,
       padding: const EdgeInsets.only(left: 8, right: 4),
-      decoration: const BoxDecoration(
-        color: Color(0xFF282828),
+      decoration: BoxDecoration(
+        color: palette.menuBar,
         border: Border(
-          bottom: BorderSide(color: Color(0xFF3A3A3A), width: 1),
+          bottom: BorderSide(color: palette.border, width: 1),
         ),
       ),
       child: Row(
         children: [
-          const Expanded(
+          Expanded(
             child: Text(
-              'Categories',
+              s.t('Categories'),
               style: TextStyle(
-                color: Color(0xFFE8E8E8),
+                color: isDark ? const Color(0xFFE8E8E8) : const Color(0xFF111827),
                 fontSize: 12,
                 fontWeight: FontWeight.w500,
               ),
@@ -187,12 +191,12 @@ class _DownloadSidebarState extends State<DownloadSidebar> {
             InkWell(
               onTap: widget.onClose,
               borderRadius: BorderRadius.circular(3),
-              child: const Padding(
-                padding: EdgeInsets.all(2),
+              child: Padding(
+                padding: const EdgeInsets.all(2),
                 child: Icon(
                   Icons.close,
                   size: 14,
-                  color: Color(0xFFD8D8D8),
+                  color: isDark ? const Color(0xFFD8D8D8) : const Color(0xFF374151),
                 ),
               ),
             ),
@@ -262,13 +266,14 @@ class _DownloadSidebarState extends State<DownloadSidebar> {
                     borderRadius: BorderRadius.circular(2),
                     border: isSelected
                         ? Border.all(
-                            color: AppColors.accent.withValues(alpha: 0.45),
+                            color: AppThemeController.instance.palette.accent
+                                .withValues(alpha: 0.55),
                             width: 0.7,
                           )
                         : null,
                   ),
                   child: Text(
-                    node.label,
+                    AppStrings.instance.t(node.label),
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: TextStyle(
@@ -345,13 +350,14 @@ class _DownloadSidebarState extends State<DownloadSidebar> {
                     borderRadius: BorderRadius.circular(2),
                     border: isSelected
                         ? Border.all(
-                            color: AppColors.accent.withValues(alpha: 0.45),
+                            color: AppThemeController.instance.palette.accent
+                                .withValues(alpha: 0.55),
                             width: 0.7,
                           )
                         : null,
                   ),
                   child: Text(
-                    node.label,
+                    AppStrings.instance.t(node.label),
                     maxLines: 1,
                     overflow: TextOverflow.ellipsis,
                     style: TextStyle(

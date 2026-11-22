@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"syscall"
 	"time"
 
@@ -17,6 +18,10 @@ import (
 )
 
 func main() {
+	// Keep resident RAM minimal (~8-15 MB idle, <64 MiB soft cap under heavy load).
+	debug.SetGCPercent(50)
+	debug.SetMemoryLimit(64 << 20)
+
 	port := flag.Int("port", 45822, "Local loopback port for the Go download engine")
 	flag.Parse()
 

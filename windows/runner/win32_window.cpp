@@ -144,6 +144,25 @@ bool Win32Window::Create(const std::wstring& title,
     return false;
   }
 
+  // Explicitly bind crisp small (title bar) and big (taskbar/Alt+Tab) FluxDM icons.
+  HINSTANCE hinst = GetModuleHandle(nullptr);
+  HICON small_icon = static_cast<HICON>(LoadImageW(
+      hinst, MAKEINTRESOURCEW(IDI_APP_ICON), IMAGE_ICON,
+      GetSystemMetrics(SM_CXSMICON), GetSystemMetrics(SM_CYSMICON),
+      LR_DEFAULTCOLOR));
+  HICON big_icon = static_cast<HICON>(LoadImageW(
+      hinst, MAKEINTRESOURCEW(IDI_APP_ICON), IMAGE_ICON,
+      GetSystemMetrics(SM_CXICON), GetSystemMetrics(SM_CYICON),
+      LR_DEFAULTCOLOR));
+  if (small_icon) {
+    SendMessageW(window, WM_SETICON, ICON_SMALL,
+                 reinterpret_cast<LPARAM>(small_icon));
+  }
+  if (big_icon) {
+    SendMessageW(window, WM_SETICON, ICON_BIG,
+                 reinterpret_cast<LPARAM>(big_icon));
+  }
+
   UpdateTheme(window);
 
   return OnCreate();

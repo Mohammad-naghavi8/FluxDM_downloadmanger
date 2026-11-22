@@ -55,7 +55,7 @@ class BrowserBridgeService {
           request.response.write(
             jsonEncode({
               'ok': true,
-              'app': 'Download Manager',
+              'app': 'FluxDM',
               'port': _boundPort,
             }),
           );

@@ -1,5 +1,6 @@
 import 'dart:io';
 
+import 'package:download_manager/core/localization/app_strings.dart';
 import 'package:download_manager/core/theme/app_colors.dart';
 import 'package:download_manager/features/downloads/services/browser_bridge_service.dart';
 import 'package:material_ui/material_ui.dart';
@@ -38,11 +39,14 @@ class BrowserIntegrationDialog extends StatelessWidget {
 
     return AlertDialog(
       backgroundColor: AppColors.surface,
-      title: const Row(
+      title: Row(
         children: [
-          Icon(Icons.language_rounded, color: AppColors.accent, size: 20),
-          SizedBox(width: 8),
-          Text('Browser Integration', style: TextStyle(fontSize: 16)),
+          const Icon(Icons.language_rounded, color: AppColors.accent, size: 20),
+          const SizedBox(width: 8),
+          Text(
+            AppStrings.instance.t('Browser Integration'),
+            style: const TextStyle(fontSize: 16),
+          ),
         ],
       ),
       content: SizedBox(
@@ -152,11 +156,11 @@ class BrowserIntegrationDialog extends StatelessWidget {
         OutlinedButton.icon(
           onPressed: () => _openExtensionFolder(context),
           icon: const Icon(Icons.folder_open_rounded, size: 16),
-          label: const Text('Open Extension Folder'),
+          label: Text(AppStrings.instance.t('Open Extension Folder')),
         ),
         ElevatedButton(
           onPressed: () => Navigator.pop(context),
-          child: const Text('Close'),
+          child: Text(AppStrings.instance.t('Close')),
         ),
       ],
     );

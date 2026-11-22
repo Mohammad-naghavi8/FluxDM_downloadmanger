@@ -40,9 +40,16 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/api/downloads/stream", s.handleDownloadStream)
 	mux.HandleFunc("/api/downloads/pause", s.handlePause)
 	mux.HandleFunc("/api/downloads/cancel", s.handleCancel)
+	mux.HandleFunc("/api/downloads/stop-all", s.handleStopAll)
 	mux.HandleFunc("/api/downloads/limit", s.handleLimit)
 	mux.HandleFunc("/api/downloads/cleanup", s.handleCleanup)
 	mux.HandleFunc("/api/downloads/saved-progress", s.handleSavedProgress)
+	mux.HandleFunc("/api/rss/fetch", s.handleRSSFetch)
+	mux.HandleFunc("/api/torrent/parse", s.handleTorrentParse)
+	mux.HandleFunc("/api/config", s.handleConfig)
+	mux.HandleFunc("/api/archive/extract", s.handleArchiveExtract)
+	mux.HandleFunc("/api/grab/links", s.handleGrabLinks)
+	mux.HandleFunc("/api/grab/video", s.handleGrabVideo)
 	mux.HandleFunc("/shutdown", s.handleShutdown)
 	return mux
 }
@@ -211,6 +218,133 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 		task.cancel()
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) handleStopAll(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	for _, task := range s.active {
+		task.paused.Store(false)
+		task.cancel()
+	}
+	s.mu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) handleRSSFetch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST required"})
+		return
+	}
+	var body struct {
+		URL string `json:"url"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		return
+	}
+	res, err := s.eng.FetchRSS(r.Context(), body.URL)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+func (s *Server) handleTorrentParse(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST required"})
+		return
+	}
+	var body struct {
+		Source string `json:"source"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		return
+	}
+	info, err := engine.ParseTorrentSource(body.Source)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, info)
+}
+
+func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST required"})
+		return
+	}
+	var cfg engine.EngineConfig
+	if err := json.NewDecoder(r.Body).Decode(&cfg); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		return
+	}
+	s.eng.ApplyConfig(cfg)
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) handleArchiveExtract(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST required"})
+		return
+	}
+	var body struct {
+		ArchivePath string `json:"archivePath"`
+		TargetMode  string `json:"targetMode"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		return
+	}
+	res, err := engine.ExtractArchive(body.ArchivePath, body.TargetMode)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+func (s *Server) handleGrabLinks(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST required"})
+		return
+	}
+	var body struct {
+		Input        string `json:"input"`
+		ProbeOnline  bool   `json:"probeOnline"`
+		HideWebPages bool   `json:"hideWebPages"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		return
+	}
+	res, err := s.eng.GrabLinks(r.Context(), body.Input, body.ProbeOnline, body.HideWebPages)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+func (s *Server) handleGrabVideo(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "POST required"})
+		return
+	}
+	var body struct {
+		URL string `json:"url"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+		return
+	}
+	res, err := s.eng.GrabVideo(r.Context(), body.URL)
+	if err != nil {
+		writeJSON(w, http.StatusBadGateway, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
 }
 
 func (s *Server) handleLimit(w http.ResponseWriter, r *http.Request) {

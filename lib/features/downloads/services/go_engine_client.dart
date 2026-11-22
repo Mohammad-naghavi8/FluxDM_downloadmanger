@@ -6,6 +6,8 @@ import 'package:dio/dio.dart';
 import 'package:download_manager/features/downloads/models/download_file_info.dart';
 import 'package:download_manager/features/downloads/models/download_progress_state.dart';
 import 'package:download_manager/features/downloads/services/go_engine_process.dart';
+import 'package:download_manager/features/settings/models/app_settings.dart';
+import 'package:download_manager/features/torrents/models/torrent_models.dart';
 
 class GoSavedProgress {
   final int downloadedBytes;
@@ -16,6 +18,42 @@ class GoSavedProgress {
     required this.downloadedBytes,
     required this.connections,
     required this.hasSegmentedState,
+  });
+}
+
+class GoGrabbedLink {
+  final String url;
+  final String name;
+  final int sizeBytes;
+  final String status;
+  final bool isWebPage;
+  final bool isDirect;
+  bool selected;
+
+  GoGrabbedLink({
+    required this.url,
+    required this.name,
+    required this.sizeBytes,
+    required this.status,
+    required this.isWebPage,
+    required this.isDirect,
+    this.selected = true,
+  });
+}
+
+class GoVideoStream {
+  final String title;
+  final String url;
+  final String quality;
+  final String format;
+  final int sizeBytes;
+
+  const GoVideoStream({
+    required this.title,
+    required this.url,
+    required this.quality,
+    required this.format,
+    required this.sizeBytes,
   });
 }
 
@@ -130,6 +168,160 @@ class GoEngineClient {
     await _postJson('/api/downloads/cancel', {
       'id': id,
     }, timeout: const Duration(seconds: 3));
+  }
+
+  Future<void> stopAllDownloads() async {
+    await _postJson('/api/downloads/stop-all', const {}, timeout: const Duration(seconds: 3));
+  }
+
+  Future<void> applyConfig(AppSettings settings) async {
+    await _postJson('/api/config', {
+      'userAgent': settings.manualUserAgent,
+      'proxyMode': settings.proxyMode,
+      'proxyServer': settings.proxyServer,
+      'proxyPort': settings.proxyPort,
+      'proxyUsername': settings.proxyUsername,
+      'proxyPassword': settings.proxyPassword,
+      'proxyHttp': settings.proxyHttp,
+      'proxyHttps': settings.proxyHttps,
+      'dnsMode': settings.dnsMode,
+      'useFtpPasv': settings.useFtpPasv,
+      'connectionExceptions': settings.connectionExceptions
+          .map((e) => e.toJson())
+          .toList(),
+      'siteLogins': settings.siteLogins.map((e) => e.toJson()).toList(),
+    }, timeout: const Duration(seconds: 4));
+  }
+
+  Future<({String extractedTo, int fileCount})> extractArchive(
+    String archivePath, {
+    String targetMode = '',
+  }) async {
+    final data = await _postJson('/api/archive/extract', {
+      'archivePath': archivePath,
+      'targetMode': targetMode,
+    }, timeout: const Duration(minutes: 5));
+    return (
+      extractedTo: data['extractedTo']?.toString() ?? '',
+      fileCount: (data['fileCount'] as num?)?.toInt() ?? 0,
+    );
+  }
+
+  Future<({String source, List<GoGrabbedLink> links})> grabLinks(
+    String input, {
+    bool probeOnline = true,
+    bool hideWebPages = true,
+  }) async {
+    final data = await _postJson('/api/grab/links', {
+      'input': input,
+      'probeOnline': probeOnline,
+      'hideWebPages': hideWebPages,
+    }, timeout: const Duration(seconds: 30));
+    final raw = data['links'] as List<dynamic>? ?? const [];
+    final links = <GoGrabbedLink>[];
+    for (final item in raw) {
+      if (item is! Map<String, dynamic>) continue;
+      links.add(
+        GoGrabbedLink(
+          url: item['url']?.toString() ?? '',
+          name: item['name']?.toString() ?? '',
+          sizeBytes: (item['sizeBytes'] as num?)?.toInt() ?? 0,
+          status: item['status']?.toString() ?? 'Ready',
+          isWebPage: item['isWebPage'] == true,
+          isDirect: item['isDirect'] == true,
+        ),
+      );
+    }
+    return (source: data['source']?.toString() ?? '', links: links);
+  }
+
+  Future<
+    ({
+      String pageTitle,
+      List<GoVideoStream> streams,
+      List<String> subtitles,
+      bool usedYtDlp,
+    })
+  >
+  grabVideo(String pageUrl) async {
+    final data = await _postJson('/api/grab/video', {
+      'url': pageUrl,
+    }, timeout: const Duration(seconds: 30));
+    final raw = data['streams'] as List<dynamic>? ?? const [];
+    final streams = <GoVideoStream>[];
+    for (final item in raw) {
+      if (item is! Map<String, dynamic>) continue;
+      streams.add(
+        GoVideoStream(
+          title: item['title']?.toString() ?? '',
+          url: item['url']?.toString() ?? '',
+          quality: item['quality']?.toString() ?? '',
+          format: item['format']?.toString() ?? '',
+          sizeBytes: (item['sizeBytes'] as num?)?.toInt() ?? 0,
+        ),
+      );
+    }
+    final subs = (data['subtitles'] as List<dynamic>? ?? const ['None'])
+        .map((e) => e.toString())
+        .toList();
+    return (
+      pageTitle: data['pageTitle']?.toString() ?? '',
+      streams: streams,
+      subtitles: subs.isEmpty ? const ['None'] : subs,
+      usedYtDlp: data['usedYtDlp'] == true,
+    );
+  }
+
+  Future<({String title, List<RssArticle> articles})> fetchRssFeed(
+    String url, {
+    required String feedId,
+  }) async {
+    final data = await _postJson('/api/rss/fetch', {'url': url});
+    final title = data['title']?.toString() ?? url;
+    final rawArticles = data['articles'] as List<dynamic>? ?? const [];
+    final articles = <RssArticle>[];
+    for (final item in rawArticles) {
+      if (item is! Map<String, dynamic>) continue;
+      articles.add(
+        RssArticle(
+          title: item['title']?.toString() ?? '',
+          link: item['link']?.toString() ?? '',
+          pubDate: item['pubDate']?.toString() ?? '',
+          feedId: feedId,
+          feedTitle: title,
+        ),
+      );
+    }
+    return (title: title, articles: articles);
+  }
+
+  Future<TorrentMetadata> parseTorrent(String source) async {
+    final data = await _postJson('/api/torrent/parse', {'source': source});
+    final rawFiles = data['files'] as List<dynamic>? ?? const [];
+    final files = <TorrentFileItem>[];
+    for (final f in rawFiles) {
+      if (f is! Map<String, dynamic>) continue;
+      files.add(
+        TorrentFileItem(
+          name: f['name']?.toString() ?? '',
+          relativePath: f['relativePath']?.toString() ?? '',
+          sizeBytes: (f['sizeBytes'] as num?)?.toInt() ?? 0,
+          selected: true,
+        ),
+      );
+    }
+    final trackers = (data['trackers'] as List<dynamic>? ?? const [])
+        .map((e) => e.toString())
+        .toList();
+
+    return TorrentMetadata(
+      source: data['source']?.toString() ?? source,
+      name: data['name']?.toString() ?? 'Torrent',
+      infoHash: data['infoHash']?.toString(),
+      trackers: trackers,
+      files: files,
+      isMagnet: data['isMagnet'] == true,
+    );
   }
 
   Future<void> cleanupPartialFiles(String savePath) async {

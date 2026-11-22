@@ -17,6 +17,8 @@ type SmartDialer struct {
 	unhealthyIPs map[string]time.Time
 	hostCursor   map[string]int
 	baseDialer   *net.Dialer
+	dnsServer    string
+	resolver     *net.Resolver
 }
 
 func NewSmartDialer() *SmartDialer {
@@ -26,6 +28,27 @@ func NewSmartDialer() *SmartDialer {
 		baseDialer: &net.Dialer{
 			Timeout:   15 * time.Second,
 			KeepAlive: 30 * time.Second,
+		},
+		resolver: net.DefaultResolver,
+	}
+}
+
+func (d *SmartDialer) SetDNSServer(addr string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if addr == d.dnsServer {
+		return
+	}
+	d.dnsServer = addr
+	if addr == "" {
+		d.resolver = net.DefaultResolver
+		return
+	}
+	target := addr
+	d.resolver = &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return d.baseDialer.DialContext(ctx, "udp", target)
 		},
 	}
 }
@@ -41,7 +64,14 @@ func (d *SmartDialer) lookupCandidates(ctx context.Context, host string) ([]stri
 		return []string{ip.String()}, nil
 	}
 
-	resolved, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	d.mu.Lock()
+	res := d.resolver
+	d.mu.Unlock()
+	if res == nil {
+		res = net.DefaultResolver
+	}
+
+	resolved, err := res.LookupIPAddr(ctx, host)
 	if err != nil || len(resolved) == 0 {
 		return nil, err
 	}
@@ -175,12 +205,15 @@ func NewSmartHTTPClient(dialer *SmartDialer) *http.Client {
 	transport := &http.Transport{
 		DialContext:           dialer.DialContext,
 		DialTLSContext:        dialer.DialTLSContext,
-		MaxIdleConns:          128,
-		MaxIdleConnsPerHost:   32,
-		IdleConnTimeout:       60 * time.Second,
+		MaxIdleConns:          48,
+		MaxIdleConnsPerHost:   16,
+		IdleConnTimeout:       30 * time.Second,
 		TLSHandshakeTimeout:   15 * time.Second,
 		ResponseHeaderTimeout: 25 * time.Second,
 		ExpectContinueTimeout: 2 * time.Second,
+		DisableCompression:    true,
+		ReadBufferSize:        64 * 1024,
+		WriteBufferSize:       32 * 1024,
 		ForceAttemptHTTP2:     false,
 	}
 

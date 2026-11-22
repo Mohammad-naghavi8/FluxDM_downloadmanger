@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:io';
 
+import 'package:download_manager/core/localization/app_strings.dart';
 import 'package:download_manager/core/theme/app_colors.dart';
 import 'package:download_manager/features/downloads/models/download_file_info.dart';
 import 'package:download_manager/features/downloads/models/download_schedule_config.dart';
@@ -441,12 +442,12 @@ class _AddDownloadDialogState extends State<AddDownloadDialog> {
             size: 17,
           ),
           const SizedBox(width: 8),
-          const Expanded(
+          Expanded(
             child: Text(
-              'Download File Info',
+              AppStrings.instance.t('Download File Info'),
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
-              style: TextStyle(
+              style: const TextStyle(
                 color: AppColors.textPrimary,
                 fontSize: 12.5,
                 fontWeight: FontWeight.w500,
@@ -454,7 +455,7 @@ class _AddDownloadDialogState extends State<AddDownloadDialog> {
             ),
           ),
           IconButton(
-            tooltip: 'Close',
+            tooltip: AppStrings.instance.t('Close'),
             onPressed: () => Navigator.pop(context),
             iconSize: 16,
             padding: EdgeInsets.zero,
@@ -479,7 +480,7 @@ class _AddDownloadDialogState extends State<AddDownloadDialog> {
       child: Padding(
         padding: const EdgeInsets.only(right: 10),
         child: Text(
-          text,
+          AppStrings.instance.t(text),
           maxLines: 1,
           softWrap: false,
           textAlign: TextAlign.right,
@@ -564,7 +565,7 @@ class _AddDownloadDialogState extends State<AddDownloadDialog> {
                     .map(
                       (cat) => DropdownMenuItem<String>(
                         value: cat,
-                        child: Text(cat),
+                        child: Text(AppStrings.instance.t(cat)),
                       ),
                     )
                     .toList(),
@@ -916,7 +917,9 @@ class _AddDownloadDialogState extends State<AddDownloadDialog> {
               textStyle: const TextStyle(fontSize: 11),
             ),
             child: Text(
-              _scheduledAt != null ? 'Scheduled' : 'Schedule',
+              AppStrings.instance.t(
+                _scheduledAt != null ? 'Scheduled' : 'Schedule',
+              ),
               overflow: TextOverflow.ellipsis,
             ),
           ),
@@ -996,7 +999,10 @@ class _AddDownloadDialogState extends State<AddDownloadDialog> {
             fontWeight: FontWeight.w500,
           ),
         ),
-        child: Text(label, overflow: TextOverflow.ellipsis),
+        child: Text(
+          AppStrings.instance.t(label),
+          overflow: TextOverflow.ellipsis,
+        ),
       ),
     );
   }

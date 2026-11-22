@@ -44,7 +44,8 @@ class DownloadService {
 
   static final Map<String, String> _resolvedHttpsRedirectCache = {};
 
-  Dio _dio = _createDio();
+  Dio? _dioInstance;
+  Dio get _dio => _dioInstance ??= _createDio();
   final FtpClientService _ftpClient = FtpClientService();
   final GoEngineClient? _customGoClient;
   final GoEngineClient _defaultGoClient = GoEngineClient();
@@ -102,8 +103,8 @@ class DownloadService {
   }
 
   void _resetClient() {
-    _dio.close(force: false);
-    _dio = _createDio();
+    _dioInstance?.close(force: false);
+    _dioInstance = null;
   }
 
   /// If an HTTPS redirector host fails TLS handshake (e.g., an expired CDN edge

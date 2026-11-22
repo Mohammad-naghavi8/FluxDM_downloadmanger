@@ -1,5 +1,6 @@
 import 'dart:math' as math;
 
+import 'package:download_manager/core/localization/app_strings.dart';
 import 'package:download_manager/core/theme/app_colors.dart';
 import 'package:download_manager/features/downloads/models/download_progress_state.dart';
 import 'package:material_ui/material_ui.dart';
@@ -341,7 +342,7 @@ class _DownloadProgressWindowState extends State<DownloadProgressWindow> {
     VoidCallback? onPressed,
   }) {
     return IconButton(
-      tooltip: tooltip,
+      tooltip: AppStrings.instance.t(tooltip),
       onPressed: onPressed ?? () {},
       icon: Icon(icon, color: Colors.black87, size: 19),
       padding: EdgeInsets.zero,
@@ -417,6 +418,7 @@ class _DownloadProgressWindowState extends State<DownloadProgressWindow> {
   }
 
   Widget _buildInfoCard(DownloadProgressState state, Color statusColor) {
+    final s = AppStrings.instance;
     return Container(
       padding: const EdgeInsets.fromLTRB(14, 12, 14, 12),
       decoration: BoxDecoration(
@@ -427,16 +429,20 @@ class _DownloadProgressWindowState extends State<DownloadProgressWindow> {
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
-          _infoRow('Address:', state.url, tooltip: state.url),
-          _infoRow('File Name:', state.fileName, tooltip: state.fileName),
-          _infoRow('Status:', state.statusLabel, valueColor: statusColor),
-          _infoRow('File size:', state.formattedFileSize),
-          _infoRow('Downloaded:', state.formattedDownloaded),
-          _infoRow('Transfer rate:', state.formattedTransferRate),
-          _infoRow('Time left:', state.formattedTimeLeft),
+          _infoRow('${s.t('Address')}:', state.url, tooltip: state.url),
+          _infoRow('${s.t('File Name')}:', state.fileName, tooltip: state.fileName),
           _infoRow(
-            'Resume\nCapability:',
-            state.resumeCapabilityLabel,
+            '${s.t('Status')}:',
+            s.t(state.statusLabel),
+            valueColor: statusColor,
+          ),
+          _infoRow('${s.t('File size')}:', state.formattedFileSize),
+          _infoRow('${s.t('Downloaded')}:', state.formattedDownloaded),
+          _infoRow('${s.t('Transfer rate')}:', state.formattedTransferRate),
+          _infoRow('${s.t('Time left')}:', state.formattedTimeLeft),
+          _infoRow(
+            '${s.t('Resume Capability')}:',
+            s.t(state.resumeCapabilityLabel),
             isLast: true,
           ),
         ],
@@ -533,10 +539,10 @@ class _DownloadProgressWindowState extends State<DownloadProgressWindow> {
             children: [
               const Icon(Icons.speed_rounded, color: AppColors.accent, size: 15),
               const SizedBox(width: 6),
-              const Expanded(
+              Expanded(
                 child: Text(
-                  'Speed Limiter',
-                  style: TextStyle(
+                  AppStrings.instance.t('Speed Limiter'),
+                  style: const TextStyle(
                     color: _valueColor,
                     fontSize: 12,
                     fontWeight: FontWeight.w600,
@@ -957,7 +963,9 @@ class _DownloadProgressWindowState extends State<DownloadProgressWindow> {
               children: [
                 Flexible(
                   child: Text(
-                    _showDetails ? 'Hide Details' : 'Show Details',
+                    AppStrings.instance.t(
+                      _showDetails ? 'Hide Details' : 'Show Details',
+                    ),
                     overflow: TextOverflow.ellipsis,
                   ),
                 ),
@@ -976,14 +984,20 @@ class _DownloadProgressWindowState extends State<DownloadProgressWindow> {
         Expanded(
           child: _flatActionButton(
             onPressed: middleAction,
-            child: Text(middleLabel, overflow: TextOverflow.ellipsis),
+            child: Text(
+              AppStrings.instance.t(middleLabel),
+              overflow: TextOverflow.ellipsis,
+            ),
           ),
         ),
         const SizedBox(width: 10),
         Expanded(
           child: _flatActionButton(
             onPressed: rightAction,
-            child: Text(rightLabel, overflow: TextOverflow.ellipsis),
+            child: Text(
+              AppStrings.instance.t(rightLabel),
+              overflow: TextOverflow.ellipsis,
+            ),
           ),
         ),
       ],
