@@ -14,6 +14,7 @@ class DownloadPathService {
     'Documents': 'Documents',
     'Images': 'Images',
     'Compressed': 'Compressed',
+    'Torrents': 'Torrents',
     'Others': 'Others',
   };
 
@@ -35,6 +36,7 @@ class DownloadPathService {
     };
     const images = {'jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp'};
     const compressed = {'zip', 'rar', '7z', 'tar', 'gz'};
+    const torrents = {'torrent'};
 
     if (programs.contains(extension)) return 'Programs';
     if (videos.contains(extension)) return 'Videos';
@@ -42,6 +44,7 @@ class DownloadPathService {
     if (documents.contains(extension)) return 'Documents';
     if (images.contains(extension)) return 'Images';
     if (compressed.contains(extension)) return 'Compressed';
+    if (torrents.contains(extension)) return 'Torrents';
 
     return 'Others';
   }

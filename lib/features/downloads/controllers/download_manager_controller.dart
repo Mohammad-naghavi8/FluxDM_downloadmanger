@@ -40,8 +40,9 @@ class DownloadManagerController extends ChangeNotifier {
     'Compressed',
     'Documents',
     'Music',
-    'Program',
+    'Programs',
     'Video',
+    'Torrents',
     'Unfinished',
     'Finished',
     'Queues',
@@ -114,14 +115,58 @@ class DownloadManagerController extends ChangeNotifier {
     }).toList(growable: false);
   }
 
+  int categoryCount(String categoryKey) {
+    int count = 0;
+    for (final entry in files) {
+      if (_matchesCategory(entry, categoryKey)) {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  bool _matchesSubCategory(DownloadEntry entry, String subCategory) {
+    return switch (subCategory) {
+      'Compressed' => entry.category == 'Compressed',
+      'Documents' => entry.category == 'Documents',
+      'Music' => entry.category == 'Music',
+      'Program' || 'Programs' => entry.category == 'Programs',
+      'Video' || 'Videos' => entry.category == 'Videos',
+      'Torrents' =>
+        entry.category == 'Torrents' ||
+            entry.fileName.toLowerCase().endsWith('.torrent'),
+      _ => true,
+    };
+  }
+
   bool _matchesCategory(DownloadEntry entry, String category) {
+    if (category.contains('::')) {
+      final parts = category.split('::');
+      final parent = parts.first;
+      final child = parts.length > 1 ? parts[1] : '';
+      return switch (parent) {
+        'Unfinished' =>
+          entry.isUnfinished && _matchesSubCategory(entry, child),
+        'Finished' => entry.isFinished && _matchesSubCategory(entry, child),
+        'Queues' => switch (child) {
+          'Main Download Queue' => entry.isQueued,
+          'Scheduled' => entry.isScheduled,
+          _ => entry.isQueued || entry.isScheduled,
+        },
+        _ => _matchesSubCategory(entry, child),
+      };
+    }
+
     return switch (category) {
       'All Downloads' => true,
       'Compressed' => entry.category == 'Compressed',
       'Documents' => entry.category == 'Documents',
       'Music' => entry.category == 'Music',
-      'Program' => entry.category == 'Programs',
-      'Video' => entry.category == 'Videos',
+      'Program' || 'Programs' => entry.category == 'Programs',
+      'Video' || 'Videos' => entry.category == 'Videos',
+      'Torrents' =>
+        entry.category == 'Torrents' ||
+            entry.fileName.toLowerCase().endsWith('.torrent'),
       'Unfinished' => entry.isUnfinished,
       'Finished' => entry.isFinished,
       'Queues' => entry.isQueued || entry.isScheduled,

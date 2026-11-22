@@ -62,7 +62,7 @@ class DownloadListView extends StatelessWidget {
             children: [
               Expanded(
                 child: Text(
-                  selectedCategory,
+                  selectedCategory.replaceAll('::', ' › '),
                   style: const TextStyle(
                     fontSize: 16,
                     fontWeight: FontWeight.bold,

@@ -28,6 +28,7 @@ class _MainWindowState extends State<MainWindow> with ClipboardListener {
   late final DownloadManagerController _controller;
   final BrowserBridgeService _browserBridge = BrowserBridgeService();
   bool _isAddDialogOpen = false;
+  bool _isSidebarVisible = true;
   String? _lastClipboardUrl;
 
   @override
@@ -227,6 +228,9 @@ class _MainWindowState extends State<MainWindow> with ClipboardListener {
           Row(
             children: [
               DownloadToolbar(
+                isSidebarVisible: _isSidebarVisible,
+                onToggleSidebar: () =>
+                    setState(() => _isSidebarVisible = !_isSidebarVisible),
                 onAdd: _showEnterAddressFlow,
                 onStart: _controller.startSelectedDownload,
                 onPause: _controller.pauseSelectedDownload,
@@ -243,12 +247,43 @@ class _MainWindowState extends State<MainWindow> with ClipboardListener {
                   builder: (context, _) {
                     return Row(
                       children: [
-                        DownloadSidebar(
-                          categories: DownloadManagerController.categories,
-                          selectedCategory: _controller.selectedCategory,
-                          queuedCount: _controller.queuedCount,
-                          onSelectCategory: _controller.selectCategory,
-                        ),
+                        if (_isSidebarVisible)
+                          DownloadSidebar(
+                            categories: DownloadManagerController.categories,
+                            selectedCategory: _controller.selectedCategory,
+                            queuedCount: _controller.queuedCount,
+                            categoryCount: _controller.categoryCount,
+                            onSelectCategory: _controller.selectCategory,
+                            onClose: () =>
+                                setState(() => _isSidebarVisible = false),
+                          )
+                        else
+                          Container(
+                            width: 24,
+                            decoration: const BoxDecoration(
+                              color: Color(0xFF1A1A1A),
+                              border: Border(
+                                right: BorderSide(
+                                  color: Color(0xFF333333),
+                                  width: 1,
+                                ),
+                              ),
+                            ),
+                            child: Tooltip(
+                              message: 'Show Categories',
+                              child: InkWell(
+                                onTap: () =>
+                                    setState(() => _isSidebarVisible = true),
+                                child: const Center(
+                                  child: Icon(
+                                    Icons.chevron_right_rounded,
+                                    size: 16,
+                                    color: Color(0xFFD0D0D0),
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
                         Expanded(
                           child: DownloadListView(
                             selectedCategory: _controller.selectedCategory,
