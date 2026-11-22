@@ -1,13 +1,13 @@
-import 'dart:io';
-
-import 'package:download_manager/features/downloads/models/download_file_info.dart';
-import 'package:download_manager/features/downloads/services/download_path_service.dart';
-import 'package:flutter/services.dart';
-import 'package:dio/dio.dart';
-import 'package:download_manager/core/theme/app_colors.dart';
-import 'package:download_manager/features/downloads/services/download_service.dart';
-import 'package:material_ui/material_ui.dart';
 import 'package:clipboard_watcher/clipboard_watcher.dart';
+import 'package:download_manager/core/widgets/sidebar.dart';
+import 'package:download_manager/core/widgets/toolbar.dart';
+import 'package:download_manager/features/downloads/controllers/download_manager_controller.dart';
+import 'package:download_manager/features/downloads/models/download_progress_state.dart';
+import 'package:download_manager/features/downloads/widgets/add_download_dialog.dart';
+import 'package:download_manager/features/downloads/widgets/download_list_view.dart';
+import 'package:download_manager/features/downloads/widgets/download_progress_window.dart';
+import 'package:flutter/services.dart';
+import 'package:material_ui/material_ui.dart';
 
 class MainWindow extends StatefulWidget {
   const new({super.key});
@@ -17,86 +17,32 @@ class MainWindow extends StatefulWidget {
 }
 
 class _MainWindowState extends State<MainWindow> with ClipboardListener {
-  String selectedCategory = 'All Downloads';
-  int selectedFileIndex = 0;
-  int? _activeDownloadIndex;
-  bool _isDownloadRunning = false;
-  int _lastReceivedBytes = 0;
-  DateTime? _lastProgressTime;
+  late final DownloadManagerController _controller;
   bool _isAddDialogOpen = false;
-  bool _isPauseRequested = false;
-  final DownloadService _downloadService = DownloadService();
-  final DownloadPathService _downloadPathService = DownloadPathService();
-  String _downloadDirectory = '';
-
-  CancelToken? _downloadCancelToken;
-
-  final categories = [
-    'All Downloads',
-    'Compressed',
-    'Documents',
-    'Music',
-    'Program',
-    'Video',
-    'Unfinished',
-    'Finished',
-    'Queues',
-  ];
-
-  final files = [
-    [
-      'Stray.Goldberg.part1.rar',
-      '4.19 GB',
-      'Downloading',
-      '2.4 MB/s',
-      '03:25',
-      '44',
-    ],
-    [
-      'Rick.and.Morty.Season.5.zip',
-      '1.13 GB',
-      'Downloading',
-      '5.1 MB/s',
-      '00:18',
-      '89',
-    ],
-    ['Stray.Goldberg.part2.rar', '2.66 GB', 'Paused', '—', '—', '21'],
-    ['WinRAR7Z.exe', '3.4 MB', 'Finished', '—', '—', '100'],
-    ['Structure.mp4', '850 MB', 'Finished', '—', '—', '100'],
-    ['Advanced Compression.mp4', '1.2 GB', 'Finished', '—', '—', '100'],
-    ['No Hard Feelings.mp3', '8.5 MB', 'Finished', '—', '—', '100'],
-    ['Competition.pdf', '12 MB', 'Finished', '—', '—', '100'],
-  ];
-
-  Future<void> _loadDownloadDirectory() async {
-    final path = await _downloadPathService.getSavedPath();
-
-    if (!mounted) return;
-
-    setState(() {
-      _downloadDirectory = path;
-    });
-
-    ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('Download location updated successfully')),
-    );
-  }
 
   @override
   void initState() {
     super.initState();
 
+    _controller = DownloadManagerController(onMessage: _showSnackBar);
     clipboardWatcher.addListener(this);
     clipboardWatcher.start();
-    _loadDownloadDirectory();
+    _controller.loadDownloadDirectory();
   }
 
   @override
   void dispose() {
     clipboardWatcher.removeListener(this);
     clipboardWatcher.stop();
-
+    _controller.dispose();
     super.dispose();
+  }
+
+  void _showSnackBar(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text(message)),
+    );
   }
 
   @override
@@ -107,7 +53,6 @@ class _MainWindowState extends State<MainWindow> with ClipboardListener {
     if (!mounted || text == null || text.isEmpty) return;
 
     final uri = Uri.tryParse(text);
-
     if (uri == null ||
         !uri.hasAuthority ||
         (uri.scheme != 'http' && uri.scheme != 'https')) {
@@ -117,7 +62,6 @@ class _MainWindowState extends State<MainWindow> with ClipboardListener {
     if (_isAddDialogOpen) return;
 
     _isAddDialogOpen = true;
-
     try {
       await _showAddDownloadDialog(initialUrl: text);
     } finally {
@@ -125,1201 +69,126 @@ class _MainWindowState extends State<MainWindow> with ClipboardListener {
     }
   }
 
+  Future<void> _showAddDownloadDialog({String? initialUrl}) async {
+    String dialogPath = _controller.downloadDirectory;
+    if (dialogPath.isEmpty) {
+      dialogPath = await _controller.downloadPathService.getSavedPath();
+    }
+    if (!mounted) return;
+
+    final result = await showDialog<AddDownloadResult>(
+      context: context,
+      builder: (_) => AddDownloadDialog(
+        downloadService: _controller.downloadService,
+        downloadPathService: _controller.downloadPathService,
+        initialDirectory: dialogPath,
+        initialUrl: initialUrl,
+        formatError: _controller.formatErrorMessage,
+        onDirectoryChanged: _controller.updateDownloadDirectory,
+      ),
+    );
+
+    if (!mounted || result == null || result.url.isEmpty) return;
+
+    await _controller.addDownload(url: result.url, fileInfo: result.fileInfo);
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      body: Row(
+      body: Stack(
         children: [
-          _toolbar(),
-          _sidebar(),
-          Expanded(child: _content()),
-        ],
-      ),
-    );
-  }
-
-  Widget _toolbar() {
-    return Container(
-      width: 48,
-      color: AppColors.accent,
-      child: Column(
-        children: [
-          _tool(Icons.menu),
-          _tool(Icons.add, onPressed: _showAddDownloadDialog),
-          const SizedBox(height: 15),
-          _tool(
-            Icons.play_circle_outline_sharp,
-            onPressed: _startSelectedDownload,
-          ),
-          _tool(
-            Icons.pause_circle_outline_outlined,
-            onPressed: _pauseSelectedDownload,
-          ),
-          _tool(Icons.stop_outlined, onPressed: _stopSelectedDownload),
-          _tool(Icons.close),
-          _tool(Icons.refresh, onPressed: _retrySelectedDownload),
-          _tool(Icons.delete_outline, onPressed: _deleteSelectedDownload),
-          const Spacer(),
-          _tool(Icons.settings),
-        ],
-      ),
-    );
-  }
-
-  Widget _tool(IconData icon, {VoidCallback? onPressed}) {
-    return IconButton(
-      onPressed: onPressed ?? () {},
-      icon: Icon(icon, color: Colors.black87),
-      tooltip: _toolTip(icon),
-    );
-  }
-
-  String _toolTip(IconData icon) {
-    if (icon == Icons.play_circle_outline_sharp) return 'Start';
-    if (icon == Icons.pause_circle_outline_outlined) return 'Pause';
-    if (icon == Icons.stop_outlined) return 'Stop';
-    if (icon == Icons.refresh) return 'Retry';
-    if (icon == Icons.delete_outline) return 'Delete';
-    return '';
-  }
-
-  Future<void> _startSelectedDownload() async {
-    if (files.isEmpty) return;
-
-    if (_isDownloadRunning) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Please wait until the previous download stops.'),
-        ),
-      );
-      return;
-    }
-
-    final file = files[selectedFileIndex];
-
-    if (file[2] == 'Finished') return;
-
-    if (file.length < 7 || file[6].isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Please add a download URL first.')),
-      );
-      return;
-    }
-
-    final url = file[6];
-
-    final fileName = file[0].replaceAll(RegExp(r'[<>:"/\\|?*]'), '_');
-
-    final savePath = file.length >= 8 && file[7].isNotEmpty
-        ? file[7]
-        : await _downloadPathService.getFilePath(
-            fileName: fileName,
-            category: _downloadPathService.getCategoryForFile(fileName),
-          );
-
-    if (file.length < 8) {
-      file.add(savePath);
-    } else {
-      file[7] = savePath;
-    }
-
-    final shouldResume = file[2] == 'Paused';
-    final cancelToken = CancelToken();
-
-    _isDownloadRunning = true;
-    _downloadCancelToken = cancelToken;
-    _activeDownloadIndex = selectedFileIndex;
-    _isPauseRequested = false;
-    _lastReceivedBytes = 0;
-    _lastProgressTime = null;
-
-    setState(() {
-      file[2] = 'Downloading';
-      file[3] = 'Connecting...';
-      file[4] = 'Calculating...';
-
-      if (!shouldResume) {
-        file[5] = '0';
-      }
-    });
-
-    bool downloadCompleted = false;
-
-    try {
-      int downloadedBytes = 0;
-
-      if (shouldResume) {
-        downloadedBytes = await _downloadService.getDownloadedBytes(savePath);
-      }
-
-      void progressCallback(int received, int total) {
-        if (!mounted) return;
-
-        final now = DateTime.now();
-        final previousTime = _lastProgressTime;
-
-        if (previousTime != null) {
-          final elapsed = now.difference(previousTime).inMilliseconds / 1000;
-
-          if (elapsed >= 1) {
-            final downloadedBytes = received - _lastReceivedBytes;
-            final speed = downloadedBytes / elapsed;
-
-            if (speed > 0) {
-              file[3] = '${(speed / (1024 * 1024)).toStringAsFixed(2)} MB/s';
-
-              if (total > 0) {
-                final remainingSeconds = (total - received) / speed;
-                final minutes = remainingSeconds ~/ 60;
-                final seconds = remainingSeconds.toInt() % 60;
-
-                file[4] =
-                    '${minutes.toString().padLeft(2, '0')}:'
-                    '${seconds.toString().padLeft(2, '0')}';
-              }
-            }
-
-            _lastReceivedBytes = received;
-            _lastProgressTime = now;
-          }
-        } else {
-          _lastReceivedBytes = received;
-          _lastProgressTime = now;
-        }
-
-        setState(() {
-          if (total > 0) {
-            file[5] = ((received / total) * 100).toStringAsFixed(0);
-            if (total >= 1024 * 1024 * 1024) {
-              file[1] =
-                  '${(total / (1024 * 1024 * 1024)).toStringAsFixed(2)} GB';
-            } else {
-              file[1] = '${(total / (1024 * 1024)).toStringAsFixed(2)} MB';
-            }
-          }
-        });
-      }
-
-      if (shouldResume && downloadedBytes > 0) {
-        final canResume = await _downloadService.supportsResume(url);
-
-        if (!canResume) {
-          throw Exception('Server does not support download resume.');
-        }
-
-        _lastReceivedBytes = downloadedBytes;
-
-        await _downloadService.resumeDownload(
-          url: url,
-          savePath: savePath,
-          downloadedBytes: downloadedBytes,
-          cancelToken: cancelToken,
-          onProgress: progressCallback,
-        );
-      } else {
-        await _downloadService.downloadFile(
-          url: url,
-          savePath: savePath,
-          cancelToken: cancelToken,
-          onProgress: progressCallback,
-        );
-      }
-
-      if (!mounted) return;
-
-      setState(() {
-        file[2] = 'Finished';
-        file[3] = '—';
-        file[4] = '—';
-        file[5] = '100';
-      });
-
-      downloadCompleted = true;
-
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(SnackBar(content: Text('Download completed: $fileName')));
-    } catch (error) {
-      if (!mounted) return;
-
-      final cancelled =
-          error is DioException && error.type == DioExceptionType.cancel;
-
-      final paused = cancelled && _isPauseRequested;
-      if (cancelled && !paused) {
-        final partialFile = File(savePath);
-
-        if (await partialFile.exists()) {
-          await partialFile.delete();
-        }
-      }
-
-      if (!mounted) return;
-
-      setState(() {
-        file[2] = paused
-            ? 'Paused'
-            : cancelled
-            ? 'Stopped'
-            : 'Failed';
-        file[3] = '—';
-        file[4] = '—';
-        if (!paused) {
-          file[5] = '0';
-        }
-      });
-
-      if (!cancelled && mounted) {
-        ScaffoldMessenger.of(context)
-            .showSnackBar(SnackBar(content: Text('Download failed: $error')));
-      }
-    } finally {
-      _isDownloadRunning = false;
-
-      if (identical(_downloadCancelToken, cancelToken)) {
-        _downloadCancelToken = null;
-        _activeDownloadIndex = null;
-      }
-    }
-
-    if (downloadCompleted && mounted) {
-      final nextIndex = _getNextQueuedDownload();
-
-      if (nextIndex != null) {
-        setState(() {
-          selectedFileIndex = nextIndex;
-        });
-
-        await _startSelectedDownload();
-      }
-    }
-  }
-
-  int? _getNextQueuedDownload() {
-    for (int i = 0; i < files.length; i++) {
-      if (files[i][2] == 'Queued') {
-        return i;
-      }
-    }
-
-    return null;
-  }
-
-  void _pauseSelectedDownload() {
-    if (files.isEmpty) return;
-
-    if (_isDownloadRunning &&
-        _downloadCancelToken != null &&
-        _activeDownloadIndex == selectedFileIndex) {
-      _isPauseRequested = true;
-
-      _downloadCancelToken!.cancel('Paused by user');
-      return;
-    }
-
-    if (files[selectedFileIndex][2] == 'Queued') {
-      setState(() {
-        files[selectedFileIndex][2] = 'Paused';
-      });
-    }
-  }
-
-  Future<void> _stopSelectedDownload() async {
-    if (files.isEmpty) return;
-
-    final file = files[selectedFileIndex];
-
-    if (file[2] == 'Finished') return;
-
-    if (_isDownloadRunning &&
-        _downloadCancelToken != null &&
-        _activeDownloadIndex == selectedFileIndex) {
-      _isPauseRequested = false;
-      _downloadCancelToken!.cancel('Stopped by user');
-      return;
-    }
-
-    final savePath = file.length >= 8 && file[7].isNotEmpty
-        ? file[7]
-        : await _downloadPathService.getFilePath(
-            fileName: file[0].replaceAll(RegExp(r'[<>:"/\\|?*]'), '_'),
-            category: _downloadPathService.getCategoryForFile(file[0]),
-          );
-    final partialFile = File(savePath);
-
-    if (await partialFile.exists()) {
-      await partialFile.delete();
-    }
-
-    if (!mounted) return;
-
-    setState(() {
-      file[2] = 'Stopped';
-      file[3] = '—';
-      file[4] = '—';
-      file[5] = '0';
-    });
-  }
-
-  void _retrySelectedDownload() {
-    if (files.isEmpty) return;
-
-    final status = files[selectedFileIndex][2];
-
-    if (status != 'Failed' && status != 'Stopped') {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Only failed or stopped downloads can be retried.'),
-        ),
-      );
-      return;
-    }
-
-    _startSelectedDownload();
-  }
-
-  void _deleteSelectedDownload() {
-    if (files.isEmpty) return;
-
-    setState(() {
-      files.removeAt(selectedFileIndex);
-
-      if (files.isEmpty) {
-        selectedFileIndex = 0;
-      } else if (selectedFileIndex >= files.length) {
-        selectedFileIndex = files.length - 1;
-      }
-    });
-  }
-
-  Future<void> _showAddDownloadDialog({String? initialUrl}) async {
-    String enteredUrl = initialUrl ?? '';
-    DownloadFileInfo? fileInfo;
-    bool isLoadingInfo = false;
-    String? infoError;
-    int infoRequestId = 0;
-    bool initialFetchStarted = false;
-
-    String dialogPath = _downloadDirectory;
-
-    if (dialogPath.isEmpty) {
-      dialogPath = await _downloadPathService.getSavedPath();
-    }
-
-    if (!mounted) return;
-
-    Future<void> fetchFileInfo(
-      String url,
-      StateSetter setDialogState,
-      BuildContext dialogContext,
-    ) async {
-      final currentRequest = ++infoRequestId;
-      final uri = Uri.tryParse(url);
-
-      if (uri == null ||
-          !uri.hasAuthority ||
-          (uri.scheme != 'http' && uri.scheme != 'https')) {
-        setDialogState(() {
-          fileInfo = null;
-          isLoadingInfo = false;
-          infoError = null;
-        });
-        return;
-      }
-
-      setDialogState(() {
-        isLoadingInfo = true;
-        fileInfo = null;
-        infoError = null;
-      });
-
-      try {
-        final info = await _downloadService.getFileInfo(url);
-
-        if (!dialogContext.mounted || currentRequest != infoRequestId) {
-          return;
-        }
-
-        setDialogState(() {
-          fileInfo = info;
-          isLoadingInfo = false;
-        });
-      } catch (error) {
-        if (!dialogContext.mounted || currentRequest != infoRequestId) {
-          return;
-        }
-
-        setDialogState(() {
-          fileInfo = null;
-          isLoadingInfo = false;
-          infoError = 'Could not retrieve file information';
-        });
-      }
-    }
-
-    final result = await showDialog<String>(
-      context: context,
-      builder: (dialogContext) {
-        return StatefulBuilder(
-          builder: (context, setDialogState) {
-            if (initialUrl != null &&
-                initialUrl.isNotEmpty &&
-                !initialFetchStarted) {
-              initialFetchStarted = true;
-
-              WidgetsBinding.instance.addPostFrameCallback((_) {
-                if (dialogContext.mounted) {
-                  fetchFileInfo(initialUrl, setDialogState, dialogContext);
-                }
-              });
-            }
-
-            return AlertDialog(
-              backgroundColor: AppColors.surface,
-              title: const Text(
-                'Add New Download',
-                style: TextStyle(fontSize: 16),
-              ),
-              content: SizedBox(
-                width: 420,
-                child: SingleChildScrollView(
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      TextFormField(
-                        autofocus: true,
-                        initialValue: initialUrl ?? '',
-                        onChanged: (value) {
-                          enteredUrl = value.trim();
-
-                          fetchFileInfo(
-                            enteredUrl,
-                            setDialogState,
-                            dialogContext,
-                          );
-                        },
-                        decoration: const InputDecoration(
-                          hintText: 'https://example.com/file.zip',
-                          labelText: 'Download URL',
-                          prefixIcon: Icon(Icons.link),
-                        ),
-                      ),
-
-                      const SizedBox(height: 18),
-
-                      if (isLoadingInfo)
-                        const Row(
-                          children: [
-                            SizedBox(
-                              width: 18,
-                              height: 18,
-                              child: CircularProgressIndicator(strokeWidth: 2),
-                            ),
-                            SizedBox(width: 10),
-                            Text('Getting file information...'),
-                          ],
-                        ),
-
-                      if (fileInfo != null) ...[
-                        const Text(
-                          'File Information',
-                          style: TextStyle(fontWeight: FontWeight.bold),
-                        ),
-                        const SizedBox(height: 10),
-                        _buildDetailRow('File name', fileInfo!.fileName),
-                        _buildDetailRow('File type', fileInfo!.fileType),
-                        _buildDetailRow('File size', fileInfo!.formattedSize),
-                        _buildDetailRow(
-                          'Resume',
-                          fileInfo!.supportsResume
-                              ? 'Supported'
-                              : 'Not supported',
-                        ),
-                      ],
-
-                      if (infoError != null) ...[
-                        const SizedBox(height: 8),
-                        Text(
-                          infoError!,
-                          style: const TextStyle(color: Colors.red),
-                        ),
-                      ],
-
-                      const SizedBox(height: 20),
-
-                      const Text(
-                        'Save location',
-                        style: TextStyle(fontWeight: FontWeight.bold),
-                      ),
-
-                      const SizedBox(height: 8),
-
-                      Text(dialogPath, style: const TextStyle(fontSize: 12)),
-
-                      const SizedBox(height: 10),
-
-                      OutlinedButton.icon(
-                        onPressed: () async {
-                          final changed = await _downloadPathService
-                              .chooseDirectory();
-
-                          if (!changed || !dialogContext.mounted) {
-                            return;
-                          }
-
-                          final newPath = await _downloadPathService
-                              .getSavedPath();
-
-                          if (!dialogContext.mounted) return;
-
-                          setDialogState(() {
-                            dialogPath = newPath;
-                          });
-
-                          if (mounted) {
-                            setState(() {
-                              _downloadDirectory = newPath;
-                            });
-                          }
-                        },
-                        icon: const Icon(Icons.folder_open),
-                        label: const Text('Browse'),
-                      ),
-                    ],
-                  ),
-                ),
-              ),
-              actions: [
-                TextButton(
-                  onPressed: () {
-                    Navigator.pop(dialogContext);
-                  },
-                  child: const Text('Cancel'),
-                ),
-                ElevatedButton(
-                  onPressed: enteredUrl.isEmpty || isLoadingInfo
-                      ? null
-                      : () {
-                          Navigator.pop(dialogContext, enteredUrl);
-                        },
-                  child: const Text('Start Download'),
-                ),
-              ],
-            );
-          },
-        );
-      },
-    );
-
-    if (!mounted || result == null || result.isEmpty) return;
-
-    final uri = Uri.tryParse(result);
-
-    if (uri == null ||
-        !uri.hasAuthority ||
-        !uri.hasScheme ||
-        (uri.scheme != 'http' && uri.scheme != 'https')) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Please enter a valid HTTP or HTTPS URL')),
-      );
-      return;
-    }
-
-    final isDuplicate = files.any(
-      (file) => file.length >= 7 && file[6] == result,
-    );
-
-    if (isDuplicate) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('This download already exists in the list'),
-        ),
-      );
-      return;
-    }
-
-    final fileName =
-        fileInfo?.fileName ??
-        (uri.pathSegments.isNotEmpty && uri.pathSegments.last.isNotEmpty
-            ? Uri.decodeComponent(uri.pathSegments.last)
-            : 'download_${DateTime.now().millisecondsSinceEpoch}');
-
-    final fileSize = fileInfo?.formattedSize ?? 'Unknown';
-
-    final shouldStartNow = !_isDownloadRunning;
-
-    setState(() {
-      files.add([fileName, fileSize, 'Queued', '—', '—', '0', result]);
-
-      if (shouldStartNow) {
-        selectedFileIndex = files.length - 1;
-      }
-    });
-
-    ScaffoldMessenger.of(context)
-        .showSnackBar(const SnackBar(content: Text('Download added to queue')));
-
-    if (shouldStartNow) {
-      await _startSelectedDownload();
-    }
-  }
-
-  int get queuedCount {
-    return files.where((file) => file[2] == 'Queued').length;
-  }
-
-  Widget _buildDetailRow(String title, String value) {
-    return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 5),
-      child: Row(
-        children: [
-          SizedBox(
-            width: 110,
-            child: Text(title, style: const TextStyle(color: Colors.grey)),
-          ),
-          Expanded(child: Text(value, overflow: TextOverflow.ellipsis)),
-        ],
-      ),
-    );
-  }
-
-  Widget _sidebar() {
-    return Container(
-      width: 224,
-      color: AppColors.sidebar,
-      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 16),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const Padding(
-            padding: EdgeInsets.symmetric(horizontal: 12, vertical: 10),
-            child: Text(
-              'LIBRARY',
-              style: TextStyle(
-                color: AppColors.textSecondary,
-                fontSize: 10,
-                fontWeight: FontWeight.bold,
-                letterSpacing: 1.2,
-              ),
-            ),
-          ),
-          const SizedBox(height: 8),
-          Expanded(
-            child: ListView(
-              padding: EdgeInsets.zero,
-              children: categories.map((category) {
-                final selected = selectedCategory == category;
-
-                return Material(
-                  color: Colors.transparent,
-                  child: ListTile(
-                    dense: true,
-                    contentPadding: const EdgeInsets.symmetric(horizontal: 12),
-                    minLeadingWidth: 20,
-                    horizontalTitleGap: 12,
-                    shape: RoundedRectangleBorder(
-                      borderRadius: BorderRadius.circular(6),
-                    ),
-                    selected: selected,
-                    selectedTileColor: AppColors.accentDark,
-                    leading: Icon(
-                      _categoryIcon(category),
-                      size: 17,
-                      color: selected
-                          ? AppColors.accent
-                          : AppColors.textSecondary,
-                    ),
-                    title: Row(
-                      children: [
-                        Expanded(
-                          child: Text(
-                            category,
-                            style: TextStyle(
-                              fontSize: 12,
-                              fontWeight: selected
-                                  ? FontWeight.bold
-                                  : FontWeight.normal,
-                              color: selected
-                                  ? AppColors.accent
-                                  : AppColors.textSecondary,
-                            ),
-                          ),
-                        ),
-                        if (category == 'Queues' && queuedCount > 0)
-                          Container(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 7,
-                              vertical: 2,
-                            ),
-                            decoration: BoxDecoration(
-                              color: AppColors.accentDark,
-                              borderRadius: BorderRadius.circular(10),
-                            ),
-                            child: Text(
-                              '$queuedCount',
-                              style: const TextStyle(
-                                color: AppColors.accent,
-                                fontSize: 10,
-                                fontWeight: FontWeight.bold,
-                              ),
-                            ),
-                          ),
-                      ],
-                    ),
-                    onTap: () {
-                      setState(() {
-                        selectedCategory = category;
-                      });
-                    },
-                  ),
-                );
-              }).toList(),
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-
-  IconData _categoryIcon(String category) {
-    return switch (category) {
-      'All Downloads' => Icons.download_rounded,
-      'Compressed' => Icons.folder_zip_outlined,
-      'Documents' => Icons.description_outlined,
-      'Music' => Icons.music_note_outlined,
-      'Program' => Icons.apps,
-      'Video' => Icons.video_library_outlined,
-      'Unfinished' => Icons.downloading_outlined,
-      'Finished' => Icons.check_circle_outline,
-      'Queues' => Icons.playlist_play,
-      _ => Icons.folder_outlined,
-    };
-  }
-
-  Widget _content() {
-    return Row(
-      children: [
-        Expanded(
-          child: Padding(
-            padding: const EdgeInsets.all(16),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  children: [
-                    Expanded(
-                      child: Text(
-                        selectedCategory,
-                        style: const TextStyle(
-                          fontSize: 16,
-                          fontWeight: FontWeight.bold,
-                        ),
-                      ),
-                    ),
-                    SizedBox(
-                      width: 220,
-                      child: TextField(
-                        decoration: InputDecoration(
-                          hintText: 'Search files',
-                          prefixIcon: const Icon(Icons.search),
-                          border: OutlineInputBorder(
-                            borderRadius: BorderRadius.circular(5),
-                          ),
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 20),
-                __tableHeader(),
-                const Divider(color: AppColors.border),
-                Expanded(
-                  child: ListView.builder(
-                    itemCount: files.length,
-                    itemBuilder: (context, index) {
-                      final file = files[index];
-
-                      if (file[2] == 'Queued') {
-                        return _queueRow(file, index);
-                      }
-
-                      return _fileRow(file, index);
-                    },
-                  ),
-                ),
-                Text(
-                  '${files.length} files',
-                  style: const TextStyle(
-                    color: AppColors.textSecondary,
-                    fontSize: 12,
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ),
-
-        SizedBox(width: 260, child: _detailsPanel()),
-      ],
-    );
-  }
-
-  Widget __tableHeader() {
-    return const Row(
-      children: [
-        Expanded(flex: 5, child: Text('File Name')),
-        Expanded(flex: 1, child: Text('Size')),
-        Expanded(flex: 2, child: Text('Status')),
-        Expanded(flex: 1, child: Text('Speed')),
-        Expanded(flex: 1, child: Text('Time Left')),
-        Expanded(flex: 2, child: Text('Progress')),
-      ],
-    );
-  }
-
-  Widget _detailsPanel() {
-    if (files.isEmpty) {
-      return Container(
-        decoration: const BoxDecoration(
-          color: AppColors.surface,
-          border: Border(left: BorderSide(color: AppColors.border)),
-        ),
-        padding: const EdgeInsets.all(18),
-        child: const Center(
-          child: Text(
-            'No download selected',
-            style: TextStyle(color: AppColors.textSecondary, fontSize: 12),
-          ),
-        ),
-      );
-    }
-
-    final file = files[selectedFileIndex];
-    final status = file[2];
-    final progress = double.parse(file[5]) / 100;
-
-    final statusColor = switch (status) {
-      'Downloading' => AppColors.accent,
-      'Paused' => AppColors.paused,
-      'Queued' => Colors.cyanAccent,
-      'Stopped' => Colors.redAccent,
-      'Failed' => Colors.redAccent,
-      'Finished' => Colors.greenAccent,
-      _ => AppColors.textSecondary,
-    };
-
-    return Container(
-      decoration: const BoxDecoration(
-        color: AppColors.surface,
-        border: Border(left: BorderSide(color: AppColors.border)),
-      ),
-      padding: const EdgeInsets.all(18),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-          const Text(
-            'DOWNLOAD DETAILS',
-            style: TextStyle(
-              fontSize: 11,
-              fontWeight: FontWeight.bold,
-              letterSpacing: 1,
-              color: AppColors.textSecondary,
-            ),
-          ),
-
-          const SizedBox(height: 28),
-
-          const Center(
-            child: Icon(
-              Icons.insert_drive_file_outlined,
-              size: 48,
-              color: AppColors.accent,
-            ),
-          ),
-
-          const SizedBox(height: 16),
-
-          Center(
-            child: Text(
-              file[0],
-              textAlign: TextAlign.center,
-              maxLines: 2,
-              overflow: TextOverflow.ellipsis,
-              style: const TextStyle(fontSize: 13, fontWeight: FontWeight.bold),
-            ),
-          ),
-
-          const SizedBox(height: 12),
-
-          Center(
-            child: Text(
-              status,
-              style: TextStyle(color: statusColor, fontSize: 12),
-            ),
-          ),
-
-          const SizedBox(height: 28),
-
-          Text(
-            '${file[5]}%',
-            style: const TextStyle(
-              fontSize: 25,
-              fontWeight: FontWeight.bold,
-              color: AppColors.accent,
-            ),
-          ),
-
-          const SizedBox(height: 10),
-
-          ClipRRect(
-            borderRadius: BorderRadius.circular(5),
-            child: LinearProgressIndicator(
-              value: progress,
-              minHeight: 7,
-              backgroundColor: AppColors.border,
-              valueColor: AlwaysStoppedAnimation(statusColor),
-            ),
-          ),
-
-          const SizedBox(height: 28),
-
-          _detailItem(Icons.storage, 'File Size', file[1]),
-          _detailItem(Icons.speed, 'Download Speed', file[3]),
-          _detailItem(Icons.timer_outlined, 'Time Left', file[4]),
-
-          const Spacer(),
-
-          const Divider(color: AppColors.border),
-
-          const SizedBox(height: 12),
-
-          const Row(
+          Row(
             children: [
-              Icon(
-                Icons.info_outline,
-                size: 15,
-                color: AppColors.textSecondary,
+              DownloadToolbar(
+                onAdd: _showAddDownloadDialog,
+                onStart: _controller.startSelectedDownload,
+                onPause: _controller.pauseSelectedDownload,
+                onStop: _controller.stopSelectedDownload,
+                onRetry: _controller.retrySelectedDownload,
+                onDelete: _controller.deleteSelectedDownload,
               ),
-              SizedBox(width: 8),
               Expanded(
-                child: Text(
-                  'Download information',
-                  style: TextStyle(
-                    fontSize: 10,
-                    color: AppColors.textSecondary,
-                  ),
+                child: ListenableBuilder(
+                  listenable: _controller,
+                  builder: (context, _) {
+                    return Row(
+                      children: [
+                        DownloadSidebar(
+                          categories: DownloadManagerController.categories,
+                          selectedCategory: _controller.selectedCategory,
+                          queuedCount: _controller.queuedCount,
+                          onSelectCategory: _controller.selectCategory,
+                        ),
+                        Expanded(
+                          child: DownloadListView(
+                            selectedCategory: _controller.selectedCategory,
+                            files: _controller.files,
+                            selectedFileIndex: _controller.selectedFileIndex,
+                            onSelectFile: _controller.selectFile,
+                            onOpenProgress:
+                                _controller.openExistingProgressWindow,
+                            onMoveQueuedFile: _controller.moveQueuedFile,
+                          ),
+                        ),
+                      ],
+                    );
+                  },
                 ),
               ),
             ],
           ),
-        ],
-      ),
-    );
-  }
+          ListenableBuilder(
+            listenable: _controller,
+            builder: (context, _) {
+              if (!_controller.isProgressWindowVisible) {
+                return const SizedBox.shrink();
+              }
 
-  Widget _detailItem(IconData icon, String title, String value) {
-    return Padding(
-      padding: const EdgeInsets.only(bottom: 22),
-      child: Row(
-        children: [
-          Icon(icon, size: 17, color: AppColors.textSecondary),
-          const SizedBox(width: 10),
-          Expanded(
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text(
-                  title,
-                  style: const TextStyle(
-                    fontSize: 10,
-                    color: AppColors.textSecondary,
-                  ),
-                ),
-                const SizedBox(height: 4),
-                Text(value, style: const TextStyle(fontSize: 12)),
-              ],
-            ),
+              return ValueListenableBuilder<DownloadProgressState?>(
+                valueListenable: _controller.progressNotifier,
+                builder: (context, progressState, _) {
+                  if (progressState == null) {
+                    return const SizedBox.shrink();
+                  }
+
+                  final targetFile = _controller.progressWindowFile;
+
+                  return DownloadProgressWindow(
+                    state: progressState,
+                    onClose: _controller.closeProgressWindow,
+                    onPause: () {
+                      if (targetFile != null) {
+                        _controller.pauseDownloadForFile(targetFile);
+                      }
+                    },
+                    onResume: () {
+                      if (targetFile != null) {
+                        _controller.resumeDownloadForFile(targetFile);
+                      }
+                    },
+                    onCancel: () {
+                      if (targetFile != null) {
+                        _controller.stopDownloadForFile(targetFile);
+                      }
+                    },
+                    onRetry: () {
+                      if (targetFile != null) {
+                        _controller.retryDownloadForFile(targetFile);
+                      }
+                    },
+                    onOpenFolder: progressState.savePath.isNotEmpty
+                        ? () => _controller.openFolderForPath(
+                            progressState.savePath,
+                          )
+                        : null,
+                  );
+                },
+              );
+            },
           ),
         ],
       ),
-    );
-  }
-
-  Widget _fileRow(List<String> file, int index) {
-    final status = file[2];
-    final progress = double.parse(file[5]) / 100;
-
-    final progressColor = switch (status) {
-      'Downloading' => AppColors.accent,
-      'Paused' => AppColors.paused,
-      'Queued' => Colors.cyanAccent,
-      'Stopped' => Colors.redAccent,
-      'Failed' => Colors.redAccent,
-      'Finished' => Colors.greenAccent,
-      _ => AppColors.textSecondary,
-    };
-
-    final selected = selectedFileIndex == index;
-
-    return GestureDetector(
-      onTap: () {
-        setState(() {
-          selectedFileIndex = index;
-        });
-      },
-      child: Container(
-        height: 58,
-        padding: const EdgeInsets.symmetric(horizontal: 8),
-        decoration: BoxDecoration(
-          color: selected
-              ? AppColors.accentDark.withValues(alpha: 0.25)
-              : Colors.transparent,
-          border: const Border(bottom: BorderSide(color: AppColors.border)),
-        ),
-        child: Row(
-          children: [
-            Expanded(
-              flex: 5,
-              child: Row(
-                children: [
-                  const Icon(
-                    Icons.insert_drive_file_outlined,
-                    color: AppColors.accent,
-                    size: 18,
-                  ),
-                  const SizedBox(width: 10),
-                  Expanded(
-                    child: Text(
-                      file[0],
-                      overflow: TextOverflow.ellipsis,
-                      style: const TextStyle(fontSize: 12),
-                    ),
-                  ),
-                ],
-              ),
-            ),
-            Expanded(
-              flex: 1,
-              child: Text(file[1], style: const TextStyle(fontSize: 11)),
-            ),
-            Expanded(
-              flex: 2,
-              child: Text(
-                status,
-                style: TextStyle(fontSize: 11, color: progressColor),
-              ),
-            ),
-            Expanded(
-              flex: 1,
-              child: Text(file[3], style: const TextStyle(fontSize: 11)),
-            ),
-            Expanded(
-              flex: 1,
-              child: Text(file[4], style: const TextStyle(fontSize: 11)),
-            ),
-            Expanded(
-              flex: 2,
-              child: Padding(
-                padding: const EdgeInsets.only(right: 12),
-                child: Column(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      '${file[5]}%',
-                      style: TextStyle(fontSize: 10, color: progressColor),
-                    ),
-                    const SizedBox(height: 5),
-                    ClipRRect(
-                      borderRadius: BorderRadius.circular(5),
-                      child: LinearProgressIndicator(
-                        value: progress,
-                        minHeight: 5,
-                        backgroundColor: AppColors.border,
-                        valueColor: AlwaysStoppedAnimation(progressColor),
-                      ),
-                    ),
-                  ],
-                ),
-              ),
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-
-  void _moveQueuedFile(int oldIndex, int newIndex) {
-    if (oldIndex < 0 || oldIndex >= files.length) return;
-    if (newIndex < 0 || newIndex >= files.length) return;
-    if (oldIndex == newIndex) return;
-
-    if (files[oldIndex][2] != 'Queued' || files[newIndex][2] != 'Queued') {
-      return;
-    }
-
-    setState(() {
-      final movedFile = files.removeAt(oldIndex);
-      files.insert(newIndex, movedFile);
-
-      if (selectedFileIndex == oldIndex) {
-        selectedFileIndex = newIndex;
-      } else if (oldIndex < selectedFileIndex &&
-          newIndex >= selectedFileIndex) {
-        selectedFileIndex--;
-      } else if (oldIndex > selectedFileIndex &&
-          newIndex <= selectedFileIndex) {
-        selectedFileIndex++;
-      }
-    });
-  }
-
-  Widget _queueRow(List<String> file, int index) {
-    return DragTarget<int>(
-      onWillAcceptWithDetails: (details) {
-        final fromIndex = details.data;
-
-        return fromIndex != index &&
-            fromIndex >= 0 &&
-            fromIndex < files.length &&
-            files[fromIndex][2] == 'Queued';
-      },
-      onAcceptWithDetails: (details) {
-        _moveQueuedFile(details.data, index);
-      },
-      builder: (context, candidates, rejected) {
-        return LongPressDraggable<int>(
-          data: index,
-          feedback: Material(
-            color: AppColors.surface,
-            elevation: 8,
-            child: SizedBox(
-              width: 420,
-              child: Padding(
-                padding: const EdgeInsets.all(12),
-                child: Text(
-                  file[0],
-                  style: const TextStyle(
-                    color: AppColors.textPrimary,
-                    fontSize: 12,
-                  ),
-                ),
-              ),
-            ),
-          ),
-          childWhenDragging: Opacity(
-            opacity: 0.3,
-            child: _fileRow(file, index),
-          ),
-          child: Container(
-            decoration: candidates.isNotEmpty
-                ? BoxDecoration(border: Border.all(color: AppColors.accent))
-                : null,
-            child: _fileRow(file, index),
-          ),
-        );
-      },
     );
   }
 }
