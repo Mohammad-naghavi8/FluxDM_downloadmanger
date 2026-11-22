@@ -1,5 +1,6 @@
 import 'dart:io';
 
+import 'package:download_manager/features/downloads/models/download_file_info.dart';
 import 'package:download_manager/features/downloads/services/download_path_service.dart';
 import 'package:flutter/services.dart';
 import 'package:dio/dio.dart';
@@ -207,11 +208,18 @@ class _MainWindowState extends State<MainWindow> with ClipboardListener {
 
     final fileName = file[0].replaceAll(RegExp(r'[<>:"/\\|?*]'), '_');
 
-    final category = _downloadPathService.getCategoryForFile(fileName);
-    final savePath = await _downloadPathService.getFilePath(
-      fileName: fileName,
-      category: category,
-    );
+    final savePath = file.length >= 8 && file[7].isNotEmpty
+        ? file[7]
+        : await _downloadPathService.getFilePath(
+            fileName: fileName,
+            category: _downloadPathService.getCategoryForFile(fileName),
+          );
+
+    if (file.length < 8) {
+      file.add(savePath);
+    } else {
+      file[7] = savePath;
+    }
 
     final shouldResume = file[2] == 'Paused';
     final cancelToken = CancelToken();
@@ -425,15 +433,12 @@ class _MainWindowState extends State<MainWindow> with ClipboardListener {
       return;
     }
 
-    final fileName = file[0].replaceAll(RegExp(r'[<>:"/\\|?*]'), '_');
-
-    final userProfile =
-        Platform.environment['USERPROFILE'] ?? Directory.current.path;
-
-    final savePath =
-        '$userProfile${Platform.pathSeparator}'
-        'Downloads${Platform.pathSeparator}$fileName';
-
+    final savePath = file.length >= 8 && file[7].isNotEmpty
+        ? file[7]
+        : await _downloadPathService.getFilePath(
+            fileName: file[0].replaceAll(RegExp(r'[<>:"/\\|?*]'), '_'),
+            category: _downloadPathService.getCategoryForFile(file[0]),
+          );
     final partialFile = File(savePath);
 
     if (await partialFile.exists()) {
@@ -466,38 +471,140 @@ class _MainWindowState extends State<MainWindow> with ClipboardListener {
 
   Future<void> _showAddDownloadDialog({String? initialUrl}) async {
     String enteredUrl = initialUrl ?? '';
+    DownloadFileInfo? fileInfo;
+    bool isLoadingInfo = false;
+    String? infoError;
+    int infoRequestId = 0;
 
     final result = await showDialog<String>(
       context: context,
       builder: (dialogContext) {
-        return AlertDialog(
-          backgroundColor: AppColors.surface,
-          title: const Text('Add New Download', style: TextStyle(fontSize: 16)),
-          content: SizedBox(
-            width: 400,
-            child: TextFormField(
-              autofocus: true,
-              initialValue: initialUrl ?? '',
-              onChanged: (value) {
-                enteredUrl = value.trim();
-              },
-              decoration: const InputDecoration(
-                hintText: 'https://example.com/file.zip',
-                labelText: 'Download URL',
-                prefixIcon: Icon(Icons.link),
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            return AlertDialog(
+              backgroundColor: AppColors.surface,
+              title: const Text(
+                'Add New Download',
+                style: TextStyle(fontSize: 16),
               ),
-            ),
-          ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(dialogContext),
-              child: const Text('Cancel'),
-            ),
-            ElevatedButton(
-              onPressed: () => Navigator.pop(dialogContext, enteredUrl),
-              child: const Text('Continue'),
-            ),
-          ],
+              content: SizedBox(
+                width: 400,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    TextFormField(
+                      autofocus: true,
+                      initialValue: initialUrl ?? '',
+                      onChanged: (value) async {
+                        enteredUrl = value.trim();
+
+                        final currentRequest = ++infoRequestId;
+                        final uri = Uri.tryParse(enteredUrl);
+
+                        if (uri == null ||
+                            !uri.hasAuthority ||
+                            (uri.scheme != 'http' && uri.scheme != 'https')) {
+                          setDialogState(() {
+                            fileInfo = null;
+                            isLoadingInfo = false;
+                            infoError = null;
+                          });
+                          return;
+                        }
+
+                        setDialogState(() {
+                          isLoadingInfo = true;
+                          fileInfo = null;
+                          infoError = null;
+                        });
+
+                        try {
+                          final info = await _downloadService.getFileInfo(
+                            enteredUrl,
+                          );
+
+                          if (!dialogContext.mounted ||
+                              currentRequest != infoRequestId) {
+                            return;
+                          }
+
+                          setDialogState(() {
+                            fileInfo = info;
+                            isLoadingInfo = false;
+                          });
+                        } catch (error) {
+                          if (!dialogContext.mounted ||
+                              currentRequest != infoRequestId) {
+                            return;
+                          }
+
+                          setDialogState(() {
+                            fileInfo = null;
+                            isLoadingInfo = false;
+                            infoError = 'Could not retrieve file information';
+                          });
+                        }
+                      },
+                      decoration: const InputDecoration(
+                        hintText: 'https://example.com/file.zip',
+                        labelText: 'Download URL',
+                        prefixIcon: Icon(Icons.link),
+                      ),
+                    ),
+
+                    const SizedBox(height: 16),
+
+                    if (isLoadingInfo)
+                      const Row(
+                        children: [
+                          SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          ),
+                          SizedBox(width: 10),
+                          Text('Getting file information...'),
+                        ],
+                      ),
+
+                    if (fileInfo != null) ...[
+                      const Text(
+                        'File Information',
+                        style: TextStyle(fontWeight: FontWeight.bold),
+                      ),
+                      const SizedBox(height: 8),
+                      _buildDetailRow('File name', fileInfo!.fileName),
+                      _buildDetailRow('File type', fileInfo!.fileType),
+                      _buildDetailRow('File size', fileInfo!.formattedSize),
+                      _buildDetailRow(
+                        'Resume',
+                        fileInfo!.supportsResume
+                            ? 'Supported'
+                            : 'Not supported',
+                      ),
+                    ],
+
+                    if (infoError != null)
+                      Text(
+                        infoError!,
+                        style: const TextStyle(color: Colors.red),
+                      ),
+                  ],
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(dialogContext),
+                  child: const Text('Cancel'),
+                ),
+                ElevatedButton(
+                  onPressed: () => Navigator.pop(dialogContext, enteredUrl),
+                  child: const Text('Continue'),
+                ),
+              ],
+            );
+          },
         );
       },
     );
