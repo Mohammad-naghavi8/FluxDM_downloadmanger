@@ -1,13 +1,39 @@
+import 'dart:async';
 import 'dart:io';
 
 import 'package:dio/dio.dart';
+import 'package:download_manager/features/downloads/models/download_entry.dart';
 import 'package:download_manager/features/downloads/models/download_file_info.dart';
 import 'package:download_manager/features/downloads/models/download_progress_state.dart';
+import 'package:download_manager/features/downloads/models/download_schedule_config.dart';
 import 'package:download_manager/features/downloads/services/download_path_service.dart';
 import 'package:download_manager/features/downloads/services/download_service.dart';
+import 'package:download_manager/features/downloads/services/speed_limiter.dart';
 import 'package:flutter/foundation.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+class _ActiveDownloadSession {
+  final DownloadService service;
+  final CancelToken cancelToken;
+  final SpeedLimiter speedLimiter;
+  bool isPauseRequested = false;
+  int lastReceivedBytes = 0;
+  DateTime? lastProgressTime;
+
+  _ActiveDownloadSession({
+    required this.service,
+    required this.cancelToken,
+    required this.speedLimiter,
+    this.lastReceivedBytes = 0,
+  });
+}
 
 class DownloadManagerController extends ChangeNotifier {
+  static const String _maxConcurrentKey = 'max_concurrent_downloads';
+  static const String _segmentsPerDownloadKey = 'segments_per_download';
+  static const String _speedLimitEnabledKey = 'speed_limit_enabled';
+  static const String _speedLimitKbpsKey = 'speed_limit_kbps';
+
   static const List<String> categories = [
     'All Downloads',
     'Compressed',
@@ -21,42 +47,95 @@ class DownloadManagerController extends ChangeNotifier {
   ];
 
   final DownloadService downloadService;
+  final DownloadService Function() _serviceFactory;
   final DownloadPathService downloadPathService;
   final void Function(String message)? onMessage;
 
   DownloadManagerController({
     DownloadService? downloadService,
+    DownloadService Function()? serviceFactory,
     DownloadPathService? downloadPathService,
     this.onMessage,
   }) : downloadService = downloadService ?? DownloadService(),
-       downloadPathService = downloadPathService ?? DownloadPathService();
+       _serviceFactory = serviceFactory ?? (() => DownloadService()),
+       downloadPathService = downloadPathService ?? DownloadPathService() {
+    _schedulerTimer = Timer.periodic(
+      const Duration(seconds: 1),
+      (_) => checkSchedules(),
+    );
+  }
 
   String selectedCategory = 'All Downloads';
-  int selectedFileIndex = 0;
+  String searchQuery = '';
+  String? selectedFileId;
   String downloadDirectory = '';
+  DownloadScheduleConfig scheduleConfig = const DownloadScheduleConfig();
 
-  int? _activeDownloadIndex;
-  bool _isDownloadRunning = false;
-  int _lastReceivedBytes = 0;
-  DateTime? _lastProgressTime;
-  bool _isPauseRequested = false;
+  int _idCounter = 0;
   bool _disposed = false;
+  Timer? _schedulerTimer;
 
-  CancelToken? _downloadCancelToken;
+  final List<DownloadEntry> files = [];
+  final Map<String, _ActiveDownloadSession> _activeSessions = {};
+  final Map<String, DownloadProgressState> _progressById = {};
+  final Map<String, int> _entrySpeedLimitBytesById = {};
+
   final ValueNotifier<DownloadProgressState?> progressNotifier =
       ValueNotifier<DownloadProgressState?>(null);
-  List<String>? _progressWindowFile;
+  String? _progressWindowEntryId;
   bool isProgressWindowVisible = false;
 
-  final Map<String, bool> _resumeCapabilityByUrl = {};
-  final Map<String, int> _knownTotalBytesByUrl = {};
-  final Map<String, int> _downloadedBytesByUrl = {};
+  int get activeDownloadCount => _activeSessions.length;
 
-  final List<List<String>> files = [];
+  int get queuedCount =>
+      files.where((entry) => entry.isQueued || entry.isScheduled).length;
 
-  int get queuedCount => files.where((file) => file[2] == 'Queued').length;
+  int get scheduledCount => files.where((entry) => entry.isScheduled).length;
 
-  List<String>? get progressWindowFile => _progressWindowFile;
+  int get maxConcurrentDownloads => scheduleConfig.maxConcurrentDownloads;
+
+  String? get progressWindowEntryId => _progressWindowEntryId;
+
+  DownloadEntry? get selectedEntry {
+    if (selectedFileId == null) return files.isEmpty ? null : files.first;
+    return findEntryById(selectedFileId!);
+  }
+
+  List<DownloadEntry> get visibleFiles {
+    final query = searchQuery.trim().toLowerCase();
+    return files.where((entry) {
+      if (!_matchesCategory(entry, selectedCategory)) {
+        return false;
+      }
+      if (query.isEmpty) return true;
+      return entry.fileName.toLowerCase().contains(query) ||
+          entry.url.toLowerCase().contains(query);
+    }).toList(growable: false);
+  }
+
+  bool _matchesCategory(DownloadEntry entry, String category) {
+    return switch (category) {
+      'All Downloads' => true,
+      'Compressed' => entry.category == 'Compressed',
+      'Documents' => entry.category == 'Documents',
+      'Music' => entry.category == 'Music',
+      'Program' => entry.category == 'Programs',
+      'Video' => entry.category == 'Videos',
+      'Unfinished' => entry.isUnfinished,
+      'Finished' => entry.isFinished,
+      'Queues' => entry.isQueued || entry.isScheduled,
+      _ => true,
+    };
+  }
+
+  DownloadEntry? findEntryById(String id) {
+    for (final entry in files) {
+      if (entry.id == id) return entry;
+    }
+    return null;
+  }
+
+  String _nextId() => 'dl_${DateTime.now().microsecondsSinceEpoch}_${++_idCounter}';
 
   void _notify() {
     if (!_disposed) {
@@ -70,13 +149,114 @@ class DownloadManagerController extends ChangeNotifier {
     }
   }
 
+  Future<void> initialize() async {
+    await Future.wait([loadDownloadDirectory(), _loadSettings()]);
+  }
+
   Future<void> loadDownloadDirectory() async {
     final path = await downloadPathService.getSavedPath();
     if (_disposed) return;
 
     downloadDirectory = path;
     _notify();
-    _emitMessage('Download location updated successfully');
+  }
+
+  Future<void> _loadSettings() async {
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      if (_disposed) return;
+
+      final savedMax = prefs.getInt(_maxConcurrentKey);
+      final savedSegments = prefs.getInt(_segmentsPerDownloadKey);
+      final savedSpeedEnabled = prefs.getBool(_speedLimitEnabledKey);
+      final savedSpeedKbps = prefs.getInt(_speedLimitKbpsKey);
+
+      scheduleConfig = scheduleConfig.copyWith(
+        maxConcurrentDownloads:
+            (savedMax != null && savedMax >= 1 && savedMax <= 8)
+            ? savedMax
+            : null,
+        segmentsPerDownload:
+            (savedSegments != null && savedSegments >= 1 && savedSegments <= 16)
+            ? savedSegments
+            : null,
+        speedLimitEnabled: savedSpeedEnabled,
+        speedLimitKBps: (savedSpeedKbps != null && savedSpeedKbps > 0)
+            ? savedSpeedKbps
+            : null,
+      );
+      _notify();
+    } catch (_) {}
+  }
+
+  Future<void> updateScheduleConfig(DownloadScheduleConfig nextConfig) async {
+    final clampedMax = nextConfig.maxConcurrentDownloads.clamp(1, 8);
+    final clampedSegments = nextConfig.segmentsPerDownload.clamp(1, 16);
+    final clampedKbps = nextConfig.speedLimitKBps.clamp(16, 1024 * 1024);
+
+    scheduleConfig = nextConfig.copyWith(
+      maxConcurrentDownloads: clampedMax,
+      segmentsPerDownload: clampedSegments,
+      speedLimitKBps: clampedKbps,
+    );
+
+    // Sync active progress states with updated effective speed limit.
+    for (final entry in files) {
+      final limitBps = effectiveSpeedLimitForEntry(entry.id);
+      _updateProgressForEntry(
+        entry,
+        (current) => current.copyWith(
+          speedLimitBytesPerSecond: limitBps > 0 ? limitBps : null,
+          clearSpeedLimit: limitBps <= 0,
+        ),
+      );
+    }
+
+    _notify();
+
+    try {
+      final prefs = await SharedPreferences.getInstance();
+      await prefs.setInt(_maxConcurrentKey, clampedMax);
+      await prefs.setInt(_segmentsPerDownloadKey, clampedSegments);
+      await prefs.setBool(
+        _speedLimitEnabledKey,
+        scheduleConfig.speedLimitEnabled,
+      );
+      await prefs.setInt(_speedLimitKbpsKey, clampedKbps);
+    } catch (_) {}
+
+    if (_activeSessions.isNotEmpty) {
+      _pumpQueue();
+    }
+  }
+
+  int effectiveSpeedLimitForEntry(String entryId) {
+    final overrideBps = _entrySpeedLimitBytesById[entryId];
+    if (overrideBps != null) {
+      return overrideBps;
+    }
+    return scheduleConfig.effectiveSpeedLimitBytesPerSecond;
+  }
+
+  void setEntrySpeedLimit(String entryId, int bytesPerSecond) {
+    if (bytesPerSecond <= 0) {
+      _entrySpeedLimitBytesById[entryId] = 0;
+    } else {
+      _entrySpeedLimitBytesById[entryId] = bytesPerSecond;
+    }
+
+    final entry = findEntryById(entryId);
+    if (entry != null) {
+      final activeLimit = effectiveSpeedLimitForEntry(entryId);
+      _updateProgressForEntry(
+        entry,
+        (current) => current.copyWith(
+          speedLimitBytesPerSecond: activeLimit > 0 ? activeLimit : null,
+          clearSpeedLimit: activeLimit <= 0,
+        ),
+      );
+    }
+    _notify();
   }
 
   void updateDownloadDirectory(String path) {
@@ -90,11 +270,15 @@ class DownloadManagerController extends ChangeNotifier {
     _notify();
   }
 
-  void selectFile(int index) {
-    if (index < 0 || index >= files.length || selectedFileIndex == index) {
-      return;
-    }
-    selectedFileIndex = index;
+  void updateSearchQuery(String query) {
+    if (searchQuery == query) return;
+    searchQuery = query;
+    _notify();
+  }
+
+  void selectFileById(String id) {
+    if (selectedFileId == id) return;
+    selectedFileId = id;
     _notify();
   }
 
@@ -123,13 +307,14 @@ class DownloadManagerController extends ChangeNotifier {
     return text;
   }
 
-  void _openProgressWindowForFile(
-    List<String> file,
+  void _openProgressWindowForEntry(
+    DownloadEntry entry,
     DownloadProgressState state,
   ) {
     if (_disposed) return;
 
-    _progressWindowFile = file;
+    _progressById[entry.id] = state;
+    _progressWindowEntryId = entry.id;
     progressNotifier.value = state;
 
     if (!isProgressWindowVisible) {
@@ -138,33 +323,37 @@ class DownloadManagerController extends ChangeNotifier {
     }
   }
 
-  void _updateProgressWindowForFile(
-    List<String> file,
+  void _updateProgressForEntry(
+    DownloadEntry entry,
     DownloadProgressState Function(DownloadProgressState current) updater,
   ) {
-    if (_disposed || !identical(_progressWindowFile, file)) return;
+    if (_disposed) return;
 
-    final current = progressNotifier.value;
+    final current = _progressById[entry.id];
     if (current == null) return;
 
-    progressNotifier.value = updater(current);
+    final next = updater(current);
+    _progressById[entry.id] = next;
+
+    if (_progressWindowEntryId == entry.id) {
+      progressNotifier.value = next;
+    }
   }
 
   Future<void> _probeResumeCapability(
-    String url,
-    List<String> file,
-    CancelToken cancelToken,
+    DownloadEntry entry,
+    _ActiveDownloadSession session,
   ) async {
-    final supported = await downloadService.supportsResume(
-      url,
-      cancelToken: cancelToken,
+    final supported = await session.service.supportsResume(
+      entry.url,
+      cancelToken: session.cancelToken,
     );
 
-    if (_disposed || cancelToken.isCancelled) return;
+    if (_disposed || session.cancelToken.isCancelled) return;
 
-    _resumeCapabilityByUrl[url] = supported;
-    _updateProgressWindowForFile(
-      file,
+    entry.supportsResume = supported;
+    _updateProgressForEntry(
+      entry,
       (current) => current.copyWith(supportsResume: supported),
     );
   }
@@ -188,15 +377,19 @@ class DownloadManagerController extends ChangeNotifier {
     }
   }
 
-  void openExistingProgressWindow(int index) {
-    if (index < 0 || index >= files.length) return;
-    selectedFileIndex = index;
-    final file = files[index];
+  void openExistingProgressWindow(String entryId) {
+    final entry = findEntryById(entryId);
+    if (entry == null) return;
+
+    selectedFileId = entry.id;
     _notify();
 
-    if (file.length < 7 || file[6].isEmpty) return;
+    if (entry.url.isEmpty) return;
 
-    if (identical(_progressWindowFile, file) && progressNotifier.value != null) {
+    final cached = _progressById[entry.id];
+    if (cached != null) {
+      _progressWindowEntryId = entry.id;
+      progressNotifier.value = cached;
       if (!isProgressWindowVisible) {
         isProgressWindowVisible = true;
         _notify();
@@ -204,11 +397,7 @@ class DownloadManagerController extends ChangeNotifier {
       return;
     }
 
-    final url = file[6];
-    final fileName = file[0];
-    final savePath = file.length >= 8 ? file[7] : '';
-    final category = downloadPathService.getCategoryForFile(fileName);
-    final status = switch (file[2]) {
+    final status = switch (entry.status) {
       'Downloading' => DownloadProgressStatus.downloading,
       'Paused' => DownloadProgressStatus.paused,
       'Stopped' => DownloadProgressStatus.stopped,
@@ -217,40 +406,43 @@ class DownloadManagerController extends ChangeNotifier {
       _ => DownloadProgressStatus.connecting,
     };
 
-    final totalBytes = _knownTotalBytesByUrl[url];
     final downloadedBytes = status == DownloadProgressStatus.completed
-        ? (totalBytes ?? _downloadedBytesByUrl[url] ?? 0)
-        : (_downloadedBytesByUrl[url] ?? 0);
+        ? (entry.totalBytes ?? entry.downloadedBytes)
+        : entry.downloadedBytes;
 
-    _openProgressWindowForFile(
-      file,
+    _openProgressWindowForEntry(
+      entry,
       DownloadProgressState(
-        url: url,
-        fileName: fileName,
-        savePath: savePath,
-        category: category,
+        url: entry.url,
+        fileName: entry.fileName,
+        savePath: entry.savePath,
+        category: entry.category,
         status: status,
         downloadedBytes: downloadedBytes,
-        totalBytes: totalBytes,
-        supportsResume: _resumeCapabilityByUrl[url],
+        totalBytes: entry.totalBytes,
+        supportsResume: entry.supportsResume,
         startedAt: DateTime.now(),
       ),
     );
 
-    if (savePath.isNotEmpty && status == DownloadProgressStatus.paused) {
-      downloadService.getSavedConnectionProgress(savePath).then((segments) {
+    if (entry.savePath.isNotEmpty && status == DownloadProgressStatus.paused) {
+      downloadService.getSavedConnectionProgress(entry.savePath).then((
+        segments,
+      ) {
         if (_disposed || segments.isEmpty) return;
-        _updateProgressWindowForFile(
-          file,
+        _updateProgressForEntry(
+          entry,
           (current) => current.copyWith(connectionSegments: segments),
         );
       });
     }
   }
 
-  Future<void> addDownload({
+  Future<DownloadEntry?> addDownload({
     required String url,
     DownloadFileInfo? fileInfo,
+    bool startNow = true,
+    DateTime? scheduledAt,
   }) async {
     final uri = Uri.tryParse(url);
 
@@ -259,16 +451,13 @@ class DownloadManagerController extends ChangeNotifier {
         !uri.hasScheme ||
         (uri.scheme != 'http' && uri.scheme != 'https')) {
       _emitMessage('Please enter a valid HTTP or HTTPS URL');
-      return;
+      return null;
     }
 
-    final isDuplicate = files.any(
-      (file) => file.length >= 7 && file[6] == url,
-    );
-
+    final isDuplicate = files.any((entry) => entry.url == url);
     if (isDuplicate) {
       _emitMessage('This download already exists in the list');
-      return;
+      return null;
     }
 
     final fileName =
@@ -277,97 +466,247 @@ class DownloadManagerController extends ChangeNotifier {
             ? Uri.decodeComponent(uri.pathSegments.last)
             : 'download_${DateTime.now().millisecondsSinceEpoch}');
 
-    final fileSize = fileInfo?.formattedSize ?? 'Unknown';
+    final category = downloadPathService.getCategoryForFile(fileName);
+    final isScheduled = scheduledAt != null && scheduledAt.isAfter(DateTime.now());
 
-    if (fileInfo != null) {
-      _resumeCapabilityByUrl[url] = fileInfo.supportsResume;
-      if (fileInfo.fileSize != null && fileInfo.fileSize! > 0) {
-        _knownTotalBytesByUrl[url] = fileInfo.fileSize!;
+    final entry = DownloadEntry(
+      id: _nextId(),
+      fileName: fileName,
+      url: url,
+      category: category,
+      sizeText: fileInfo?.formattedSize ?? 'Unknown',
+      status: isScheduled ? 'Scheduled' : 'Queued',
+      totalBytes: fileInfo?.fileSize,
+      supportsResume: fileInfo?.supportsResume,
+      scheduledAt: isScheduled ? scheduledAt : null,
+    );
+
+    if (isScheduled) {
+      entry.timeLeftText = 'At ${entry.formattedScheduleTime}';
+    }
+
+    files.add(entry);
+    selectedFileId = entry.id;
+    _notify();
+
+    if (isScheduled) {
+      _emitMessage(
+        'Scheduled "${entry.fileName}" for ${DownloadScheduleConfig.formatScheduleDateTime(scheduledAt)}',
+      );
+      return entry;
+    }
+
+    if (startNow) {
+      if (_activeSessions.length < maxConcurrentDownloads) {
+        unawaited(_startDownloadEntry(entry));
+      } else {
+        _emitMessage(
+          'Added to queue ($activeDownloadCount/$maxConcurrentDownloads active)',
+        );
+      }
+    } else {
+      _emitMessage('Download added to queue');
+    }
+
+    return entry;
+  }
+
+  void scheduleEntry(String entryId, DateTime? scheduledAt) {
+    final entry = findEntryById(entryId);
+    if (entry == null || entry.isFinished || entry.isDownloading) return;
+
+    if (scheduledAt == null) {
+      entry.scheduledAt = null;
+      if (entry.isScheduled) {
+        entry.status = 'Queued';
+        entry.timeLeftText = '—';
+      }
+      _notify();
+      _emitMessage('Schedule cleared for ${entry.fileName}');
+      return;
+    }
+
+    entry.scheduledAt = scheduledAt;
+    entry.status = 'Scheduled';
+    entry.speedText = '—';
+    entry.timeLeftText = 'At ${entry.formattedScheduleTime}';
+    _notify();
+
+    _emitMessage(
+      'Scheduled "${entry.fileName}" for ${DownloadScheduleConfig.formatScheduleDateTime(scheduledAt)}',
+    );
+  }
+
+  @visibleForTesting
+  void checkSchedules([DateTime? nowOverride]) {
+    if (_disposed) return;
+    final now = nowOverride ?? DateTime.now();
+
+    // 1. Trigger individual scheduled downloads whose time has arrived.
+    final triggeredEntries = <DownloadEntry>[];
+    for (final entry in files) {
+      if (entry.isScheduled &&
+          entry.scheduledAt != null &&
+          !now.isBefore(entry.scheduledAt!)) {
+        entry.scheduledAt = null;
+        entry.status = 'Queued';
+        entry.timeLeftText = '—';
+        triggeredEntries.add(entry);
+        _emitMessage('Scheduled download starting: ${entry.fileName}');
+      }
+    }
+    if (triggeredEntries.isNotEmpty) {
+      _notify();
+      for (final entry in triggeredEntries) {
+        if (_activeSessions.length >= maxConcurrentDownloads) break;
+        if (!_activeSessions.containsKey(entry.id)) {
+          unawaited(_startDownloadEntry(entry));
+        }
       }
     }
 
-    final shouldStartNow = !_isDownloadRunning;
-
-    files.add([fileName, fileSize, 'Queued', '—', '—', '0', url]);
-    if (shouldStartNow) {
-      selectedFileIndex = files.length - 1;
+    // 2. Trigger global queue auto-start schedule.
+    if (scheduleConfig.autoStartQueueEnabled &&
+        scheduleConfig.queueStartTime != null &&
+        !now.isBefore(scheduleConfig.queueStartTime!)) {
+      scheduleConfig = scheduleConfig.copyWith(autoStartQueueEnabled: false);
+      _notify();
+      _emitMessage('Scheduled queue started automatically');
+      startQueue();
     }
-    _notify();
 
-    _emitMessage('Download added to queue');
+    // 3. Trigger global auto-stop (pause all active downloads).
+    if (scheduleConfig.autoStopEnabled &&
+        scheduleConfig.queueStopTime != null &&
+        !now.isBefore(scheduleConfig.queueStopTime!)) {
+      scheduleConfig = scheduleConfig.copyWith(autoStopEnabled: false);
+      _notify();
+      if (_activeSessions.isNotEmpty) {
+        pauseAllDownloads();
+        _emitMessage('Active downloads paused by schedule');
+      }
+    }
+  }
 
-    if (shouldStartNow) {
-      await startSelectedDownload();
+  void startQueue() {
+    if (_disposed) return;
+    final queued = files.where((e) => e.isQueued).toList();
+    if (queued.isEmpty) {
+      _emitMessage('No queued downloads to start.');
+      return;
+    }
+    _pumpQueue();
+  }
+
+  void _pumpQueue() {
+    if (_disposed) return;
+
+    for (final entry in files) {
+      if (_activeSessions.length >= maxConcurrentDownloads) {
+        break;
+      }
+      if (entry.isQueued && !_activeSessions.containsKey(entry.id)) {
+        unawaited(_startDownloadEntry(entry));
+      }
+    }
+  }
+
+  void pauseAllDownloads() {
+    final activeIds = _activeSessions.keys.toList();
+    for (final id in activeIds) {
+      pauseDownloadById(id);
     }
   }
 
   Future<void> startSelectedDownload() async {
-    if (files.isEmpty) return;
-    await _startDownloadAt(selectedFileIndex);
+    final entry = selectedEntry;
+    if (entry == null) return;
+    await startDownloadById(entry.id);
   }
 
-  Future<void> _startDownloadAt(int index) async {
-    if (files.isEmpty || index < 0 || index >= files.length) return;
+  Future<void> startDownloadById(String entryId) async {
+    final entry = findEntryById(entryId);
+    if (entry == null) return;
 
-    if (_isDownloadRunning) {
-      _emitMessage('Please wait until the previous download stops.');
+    if (entry.isFinished) return;
+
+    if (_activeSessions.containsKey(entry.id)) {
+      openExistingProgressWindow(entry.id);
       return;
     }
 
-    final file = files[index];
-    if (file[2] == 'Finished') return;
+    if (_activeSessions.length >= maxConcurrentDownloads) {
+      entry.scheduledAt = null;
+      entry.status = 'Queued';
+      entry.timeLeftText = '—';
+      _notify();
+      _emitMessage(
+        'Maximum simultaneous downloads ($maxConcurrentDownloads) active — queued.',
+      );
+      return;
+    }
 
-    if (file.length < 7 || file[6].isEmpty) {
+    await _startDownloadEntry(entry);
+  }
+
+  Future<void> _startDownloadEntry(DownloadEntry entry) async {
+    if (_disposed || entry.isFinished) return;
+    if (_activeSessions.containsKey(entry.id)) return;
+
+    if (entry.url.isEmpty) {
       _emitMessage('Please add a download URL first.');
       return;
     }
 
-    final url = file[6];
-    final displayFileName = file[0];
+    final url = entry.url;
+    final displayFileName = entry.fileName;
     final safeFileName = displayFileName.replaceAll(RegExp(r'[<>:"/\\|?*]'), '_');
     final category = downloadPathService.getCategoryForFile(safeFileName);
+    entry.category = category;
 
-    final savePath = file.length >= 8 && file[7].isNotEmpty
-        ? file[7]
+    // Reserve active slot immediately before async path lookup to prevent double starts.
+    final cancelToken = CancelToken();
+    final sessionService = _serviceFactory();
+    final speedLimiter = SpeedLimiter(
+      () => effectiveSpeedLimitForEntry(entry.id),
+    );
+    final shouldResume = entry.isPaused;
+    final initialDownloadedBytes = shouldResume ? entry.downloadedBytes : 0;
+
+    final session = _ActiveDownloadSession(
+      service: sessionService,
+      cancelToken: cancelToken,
+      speedLimiter: speedLimiter,
+      lastReceivedBytes: initialDownloadedBytes,
+    );
+    _activeSessions[entry.id] = session;
+
+    final savePath = entry.savePath.isNotEmpty
+        ? entry.savePath
         : await downloadPathService.getFilePath(
             fileName: safeFileName,
             category: category,
           );
 
-    if (_disposed) return;
-
-    final currentIndex = files.indexOf(file);
-    if (currentIndex == -1 || _isDownloadRunning) return;
-
-    if (file.length < 8) {
-      file.add(savePath);
-    } else {
-      file[7] = savePath;
+    if (_disposed || !files.contains(entry) || cancelToken.isCancelled) {
+      _activeSessions.remove(entry.id);
+      return;
     }
 
-    final shouldResume = file[2] == 'Paused';
-    final cancelToken = CancelToken();
-    final knownTotalBytes = _knownTotalBytesByUrl[url];
-    final initialDownloadedBytes =
-        shouldResume ? (_downloadedBytesByUrl[url] ?? 0) : 0;
-
-    _isDownloadRunning = true;
-    _downloadCancelToken = cancelToken;
-    _activeDownloadIndex = currentIndex;
-    _isPauseRequested = false;
-    _lastReceivedBytes = initialDownloadedBytes;
-    _lastProgressTime = null;
-
-    file[2] = 'Downloading';
-    file[3] = 'Connecting...';
-    file[4] = 'Calculating...';
+    entry.savePath = savePath;
+    entry.scheduledAt = null;
+    entry.status = 'Downloading';
+    entry.speedText = 'Connecting...';
+    entry.timeLeftText = 'Calculating...';
     if (!shouldResume) {
-      file[5] = '0';
+      entry.progressPercent = 0;
+      entry.downloadedBytes = 0;
     }
     _notify();
 
-    _openProgressWindowForFile(
-      file,
+    final initialLimit = effectiveSpeedLimitForEntry(entry.id);
+    _openProgressWindowForEntry(
+      entry,
       DownloadProgressState(
         url: url,
         fileName: displayFileName,
@@ -375,10 +714,11 @@ class DownloadManagerController extends ChangeNotifier {
         category: category,
         status: DownloadProgressStatus.connecting,
         downloadedBytes: initialDownloadedBytes,
-        totalBytes: knownTotalBytes,
-        supportsResume: _resumeCapabilityByUrl[url],
+        totalBytes: entry.totalBytes,
+        supportsResume: entry.supportsResume,
         isResumedTransfer: shouldResume && initialDownloadedBytes > 0,
         resumeStartBytes: shouldResume ? initialDownloadedBytes : 0,
+        speedLimitBytesPerSecond: initialLimit > 0 ? initialLimit : null,
         startedAt: DateTime.now(),
       ),
     );
@@ -387,26 +727,26 @@ class DownloadManagerController extends ChangeNotifier {
     double currentSpeed = 0;
     Duration? currentRemaining;
     int latestReceived = initialDownloadedBytes;
-    int latestTotal = knownTotalBytes ?? -1;
+    int latestTotal = entry.totalBytes ?? -1;
 
     try {
       int downloadedBytes = 0;
 
       if (shouldResume) {
-        downloadedBytes = await downloadService.getDownloadedBytes(savePath);
+        downloadedBytes = await sessionService.getDownloadedBytes(savePath);
         if (_disposed) return;
 
         latestReceived = downloadedBytes;
-        _downloadedBytesByUrl[url] = downloadedBytes;
+        entry.downloadedBytes = downloadedBytes;
 
-        final savedSegments = await downloadService.getSavedConnectionProgress(
+        final savedSegments = await sessionService.getSavedConnectionProgress(
           savePath,
           pausedLabel: 'Connecting...',
         );
         if (_disposed) return;
 
-        _updateProgressWindowForFile(
-          file,
+        _updateProgressForEntry(
+          entry,
           (current) => current.copyWith(
             downloadedBytes: downloadedBytes,
             isResumedTransfer: downloadedBytes > 0,
@@ -418,30 +758,29 @@ class DownloadManagerController extends ChangeNotifier {
         );
       }
 
-      if (_resumeCapabilityByUrl[url] == null ||
-          _knownTotalBytesByUrl[url] == null) {
+      if (entry.supportsResume == null || entry.totalBytes == null) {
         try {
-          final info = await downloadService.getFileInfo(url);
+          final info = await sessionService.getFileInfo(url);
           if (_disposed || cancelToken.isCancelled) return;
 
-          _resumeCapabilityByUrl[url] = info.supportsResume;
+          entry.supportsResume = info.supportsResume;
           if (info.fileSize != null && info.fileSize! > 0) {
-            _knownTotalBytesByUrl[url] = info.fileSize!;
+            entry.totalBytes = info.fileSize!;
             latestTotal = info.fileSize!;
-            file[1] = info.formattedSize;
+            entry.sizeText = info.formattedSize;
             _notify();
           }
 
-          _updateProgressWindowForFile(
-            file,
+          _updateProgressForEntry(
+            entry,
             (current) => current.copyWith(
               supportsResume: info.supportsResume,
               totalBytes: info.fileSize ?? current.totalBytes,
             ),
           );
         } catch (_) {
-          if (!shouldResume && _resumeCapabilityByUrl[url] == null) {
-            _probeResumeCapability(url, file, cancelToken);
+          if (!shouldResume && entry.supportsResume == null) {
+            unawaited(_probeResumeCapability(entry, session));
           }
         }
       }
@@ -451,32 +790,32 @@ class DownloadManagerController extends ChangeNotifier {
         int total, {
         List<DownloadConnectionProgress>? connections,
       }) {
-        if (_disposed || !identical(_downloadCancelToken, cancelToken)) return;
+        if (_disposed || !identical(_activeSessions[entry.id], session)) return;
 
         latestReceived = received;
-        _downloadedBytesByUrl[url] = received;
+        entry.downloadedBytes = received;
 
         if (total > 0) {
           latestTotal = total;
-          _knownTotalBytesByUrl[url] = total;
+          entry.totalBytes = total;
         }
 
         bool listRowChanged = false;
         final now = DateTime.now();
-        final previousTime = _lastProgressTime;
+        final previousTime = session.lastProgressTime;
 
         if (previousTime != null) {
           final elapsed = now.difference(previousTime).inMilliseconds / 1000;
 
           if (elapsed >= 0.75) {
-            final deltaBytes = received - _lastReceivedBytes;
+            final deltaBytes = received - session.lastReceivedBytes;
             final speed = deltaBytes / elapsed;
 
             if (speed > 0) {
               currentSpeed = speed;
               final formattedSpeed = DownloadProgressState.formatSpeed(speed);
-              if (file[3] != formattedSpeed) {
-                file[3] = formattedSpeed;
+              if (entry.speedText != formattedSpeed) {
+                entry.speedText = formattedSpeed;
                 listRowChanged = true;
               }
 
@@ -486,49 +825,46 @@ class DownloadManagerController extends ChangeNotifier {
                 final formattedRemaining = DownloadProgressState.formatDuration(
                   currentRemaining!,
                 );
-                if (file[4] != formattedRemaining) {
-                  file[4] = formattedRemaining;
+                if (entry.timeLeftText != formattedRemaining) {
+                  entry.timeLeftText = formattedRemaining;
                   listRowChanged = true;
                 }
               } else {
                 currentRemaining = null;
-                if (file[4] != 'Unknown') {
-                  file[4] = 'Unknown';
+                if (entry.timeLeftText != 'Unknown') {
+                  entry.timeLeftText = 'Unknown';
                   listRowChanged = true;
                 }
               }
             }
 
-            _lastReceivedBytes = received;
-            _lastProgressTime = now;
+            session.lastReceivedBytes = received;
+            session.lastProgressTime = now;
           }
         } else {
-          _lastReceivedBytes = received;
-          _lastProgressTime = now;
+          session.lastReceivedBytes = received;
+          session.lastProgressTime = now;
         }
 
         if (total > 0) {
-          final nextPct = ((received / total) * 100)
-              .clamp(0, 100)
-              .toStringAsFixed(0);
+          final nextPct = ((received / total) * 100).round().clamp(0, 100);
           final nextSize = DownloadProgressState.formatBytes(total);
-          if (file[5] != nextPct) {
-            file[5] = nextPct;
+          if (entry.progressPercent != nextPct) {
+            entry.progressPercent = nextPct;
             listRowChanged = true;
           }
-          if (file[1] != nextSize) {
-            file[1] = nextSize;
+          if (entry.sizeText != nextSize) {
+            entry.sizeText = nextSize;
             listRowChanged = true;
           }
         }
 
-        // Only rebuild the main window file list when visible list cells changed.
         if (listRowChanged) {
           _notify();
         }
 
-        _updateProgressWindowForFile(
-          file,
+        _updateProgressForEntry(
+          entry,
           (current) => current.copyWith(
             status: current.status == DownloadProgressStatus.rebuilding
                 ? DownloadProgressStatus.rebuilding
@@ -538,21 +874,38 @@ class DownloadManagerController extends ChangeNotifier {
             speedBytesPerSecond: currentSpeed,
             remainingTime: currentRemaining,
             clearRemainingTime: currentRemaining == null,
-            supportsResume: _resumeCapabilityByUrl[url] ?? current.supportsResume,
+            supportsResume: entry.supportsResume ?? current.supportsResume,
             connectionSegments: connections ?? current.connectionSegments,
           ),
         );
       }
 
-      void rebuildingCallback() {
-        if (_disposed || !identical(_downloadCancelToken, cancelToken)) return;
+      void reconnectingCallback(int attempt) {
+        if (_disposed || !identical(_activeSessions[entry.id], session)) return;
 
-        file[3] = 'Rebuilding...';
-        file[4] = '—';
+        entry.speedText = 'Reconnecting...';
+        entry.timeLeftText = 'Attempt $attempt';
         _notify();
 
-        _updateProgressWindowForFile(
-          file,
+        _updateProgressForEntry(
+          entry,
+          (current) => current.copyWith(
+            status: DownloadProgressStatus.reconnecting,
+            speedBytesPerSecond: 0,
+            clearRemainingTime: true,
+          ),
+        );
+      }
+
+      void rebuildingCallback() {
+        if (_disposed || !identical(_activeSessions[entry.id], session)) return;
+
+        entry.speedText = 'Rebuilding...';
+        entry.timeLeftText = '—';
+        _notify();
+
+        _updateProgressForEntry(
+          entry,
           (current) => current.copyWith(
             status: DownloadProgressStatus.rebuilding,
             speedBytesPerSecond: 0,
@@ -561,25 +914,26 @@ class DownloadManagerController extends ChangeNotifier {
         );
       }
 
-      final hasSegmented = await downloadService.hasSegmentedState(savePath);
+      final hasSegmented = await sessionService.hasSegmentedState(savePath);
       if (_disposed) return;
 
-      final resolvedTotal = _knownTotalBytesByUrl[url];
+      final resolvedTotal = entry.totalBytes;
       final canUseSegmented =
-          _resumeCapabilityByUrl[url] == true &&
+          scheduleConfig.segmentsPerDownload > 1 &&
+          entry.supportsResume == true &&
           resolvedTotal != null &&
           resolvedTotal >= DownloadService.minSegmentedSizeBytes;
 
       if (shouldResume && hasSegmented && resolvedTotal != null) {
-        final canResume = await downloadService.supportsResume(
+        final canResume = await sessionService.supportsResume(
           url,
           cancelToken: cancelToken,
         );
         if (_disposed) return;
 
-        _resumeCapabilityByUrl[url] = canResume;
-        _updateProgressWindowForFile(
-          file,
+        entry.supportsResume = canResume;
+        _updateProgressForEntry(
+          entry,
           (current) => current.copyWith(supportsResume: canResume),
         );
 
@@ -587,29 +941,32 @@ class DownloadManagerController extends ChangeNotifier {
           throw Exception('Server does not support download resume.');
         }
 
-        _lastReceivedBytes = downloadedBytes;
+        session.lastReceivedBytes = downloadedBytes;
 
-        await downloadService.downloadFileSegmented(
+        await sessionService.downloadFileSegmented(
           url: url,
           savePath: savePath,
           totalBytes: resolvedTotal,
+          connectionCount: scheduleConfig.segmentsPerDownload,
+          speedLimiter: session.speedLimiter,
           cancelToken: cancelToken,
           resumeExisting: true,
           onProgress: (r, t) => handleProgress(r, t),
           onSegmentedProgress: (r, t, conns) =>
               handleProgress(r, t, connections: conns),
+          onReconnecting: reconnectingCallback,
           onRebuilding: rebuildingCallback,
         );
       } else if (shouldResume && downloadedBytes > 0) {
-        final canResume = await downloadService.supportsResume(
+        final canResume = await sessionService.supportsResume(
           url,
           cancelToken: cancelToken,
         );
         if (_disposed) return;
 
-        _resumeCapabilityByUrl[url] = canResume;
-        _updateProgressWindowForFile(
-          file,
+        entry.supportsResume = canResume;
+        _updateProgressForEntry(
+          entry,
           (current) => current.copyWith(supportsResume: canResume),
         );
 
@@ -617,31 +974,38 @@ class DownloadManagerController extends ChangeNotifier {
           throw Exception('Server does not support download resume.');
         }
 
-        _lastReceivedBytes = downloadedBytes;
+        session.lastReceivedBytes = downloadedBytes;
 
-        await downloadService.resumeDownload(
+        await sessionService.resumeDownload(
           url: url,
           savePath: savePath,
           downloadedBytes: downloadedBytes,
+          speedLimiter: session.speedLimiter,
+          onReconnecting: reconnectingCallback,
           cancelToken: cancelToken,
           onProgress: (r, t) => handleProgress(r, t),
         );
       } else if (canUseSegmented) {
-        await downloadService.downloadFileSegmented(
+        await sessionService.downloadFileSegmented(
           url: url,
           savePath: savePath,
           totalBytes: resolvedTotal,
+          connectionCount: scheduleConfig.segmentsPerDownload,
+          speedLimiter: session.speedLimiter,
           cancelToken: cancelToken,
           resumeExisting: false,
           onProgress: (r, t) => handleProgress(r, t),
           onSegmentedProgress: (r, t, conns) =>
               handleProgress(r, t, connections: conns),
+          onReconnecting: reconnectingCallback,
           onRebuilding: rebuildingCallback,
         );
       } else {
-        await downloadService.downloadFile(
+        await sessionService.downloadFile(
           url: url,
           savePath: savePath,
+          speedLimiter: session.speedLimiter,
+          onReconnecting: reconnectingCallback,
           cancelToken: cancelToken,
           onProgress: (r, t) => handleProgress(r, t),
         );
@@ -651,7 +1015,7 @@ class DownloadManagerController extends ChangeNotifier {
 
       int finalTotalBytes = latestTotal > 0
           ? latestTotal
-          : await downloadService.getDownloadedBytes(savePath);
+          : await sessionService.getDownloadedBytes(savePath);
       if (_disposed) return;
 
       if (finalTotalBytes <= 0 && latestReceived > 0) {
@@ -659,21 +1023,19 @@ class DownloadManagerController extends ChangeNotifier {
       }
 
       if (finalTotalBytes > 0) {
-        _knownTotalBytesByUrl[url] = finalTotalBytes;
-        _downloadedBytesByUrl[url] = finalTotalBytes;
+        entry.totalBytes = finalTotalBytes;
+        entry.downloadedBytes = finalTotalBytes;
+        entry.sizeText = DownloadProgressState.formatBytes(finalTotalBytes);
       }
 
-      if (finalTotalBytes > 0) {
-        file[1] = DownloadProgressState.formatBytes(finalTotalBytes);
-      }
-      file[2] = 'Finished';
-      file[3] = '—';
-      file[4] = '—';
-      file[5] = '100';
+      entry.status = 'Finished';
+      entry.speedText = '—';
+      entry.timeLeftText = '—';
+      entry.progressPercent = 100;
       _notify();
 
-      _updateProgressWindowForFile(
-        file,
+      _updateProgressForEntry(
+        entry,
         (current) => current.copyWith(
           status: DownloadProgressStatus.completed,
           downloadedBytes: finalTotalBytes > 0
@@ -695,39 +1057,39 @@ class DownloadManagerController extends ChangeNotifier {
           (error is DioException && error.type == DioExceptionType.cancel) ||
           cancelToken.isCancelled;
 
-      final paused = cancelled && _isPauseRequested;
+      final paused = cancelled && session.isPauseRequested;
       int pausedBytes = latestReceived;
       List<DownloadConnectionProgress> savedSegments = const [];
 
       if (cancelled && !paused) {
-        await downloadService.cleanupPartialFiles(savePath);
-        _downloadedBytesByUrl[url] = 0;
+        await sessionService.cleanupPartialFiles(savePath);
+        entry.downloadedBytes = 0;
       } else if (paused) {
-        pausedBytes = await downloadService.getDownloadedBytes(savePath);
-        savedSegments = await downloadService.getSavedConnectionProgress(
+        pausedBytes = await sessionService.getDownloadedBytes(savePath);
+        savedSegments = await sessionService.getSavedConnectionProgress(
           savePath,
           pausedLabel: 'Paused',
         );
-        _downloadedBytesByUrl[url] = pausedBytes;
+        entry.downloadedBytes = pausedBytes;
       }
 
       if (_disposed) return;
 
-      file[2] = paused
+      entry.status = paused
           ? 'Paused'
           : cancelled
           ? 'Stopped'
           : 'Failed';
-      file[3] = '—';
-      file[4] = '—';
+      entry.speedText = '—';
+      entry.timeLeftText = '—';
       if (!paused) {
-        file[5] = '0';
+        entry.progressPercent = 0;
       }
       _notify();
 
       if (paused) {
-        _updateProgressWindowForFile(
-          file,
+        _updateProgressForEntry(
+          entry,
           (current) => current.copyWith(
             status: DownloadProgressStatus.paused,
             downloadedBytes: pausedBytes,
@@ -740,8 +1102,8 @@ class DownloadManagerController extends ChangeNotifier {
           ),
         );
       } else if (cancelled) {
-        _updateProgressWindowForFile(
-          file,
+        _updateProgressForEntry(
+          entry,
           (current) => current.copyWith(
             status: DownloadProgressStatus.stopped,
             downloadedBytes: 0,
@@ -753,8 +1115,8 @@ class DownloadManagerController extends ChangeNotifier {
         );
       } else {
         final message = formatErrorMessage(error);
-        _updateProgressWindowForFile(
-          file,
+        _updateProgressForEntry(
+          entry,
           (current) => current.copyWith(
             status: DownloadProgressStatus.failed,
             downloadedBytes: 0,
@@ -769,55 +1131,43 @@ class DownloadManagerController extends ChangeNotifier {
         _emitMessage('Download failed: ${formatErrorMessage(error)}');
       }
     } finally {
-      if (identical(_downloadCancelToken, cancelToken)) {
-        _isDownloadRunning = false;
-        _downloadCancelToken = null;
-        _activeDownloadIndex = null;
+      if (identical(_activeSessions[entry.id], session)) {
+        _activeSessions.remove(entry.id);
       }
     }
 
-    if (downloadCompleted && !_disposed) {
-      final nextIndex = _getNextQueuedDownload();
-      if (nextIndex != null) {
-        selectedFileIndex = nextIndex;
-        _notify();
-        await _startDownloadAt(nextIndex);
-      }
+    if (downloadCompleted &&
+        !_disposed &&
+        !scheduleConfig.autoStartQueueEnabled) {
+      _pumpQueue();
     }
-  }
-
-  int? _getNextQueuedDownload() {
-    for (int i = 0; i < files.length; i++) {
-      if (files[i][2] == 'Queued') {
-        return i;
-      }
-    }
-    return null;
   }
 
   void pauseSelectedDownload() {
-    if (files.isEmpty) return;
-    pauseDownloadForFile(files[selectedFileIndex]);
+    final entry = selectedEntry;
+    if (entry == null) return;
+    pauseDownloadById(entry.id);
   }
 
-  void pauseDownloadForFile(List<String> targetFile) {
-    final index = files.indexOf(targetFile);
-    if (index == -1) return;
+  void pauseDownloadById(String entryId) {
+    final entry = findEntryById(entryId);
+    if (entry == null) return;
 
-    if (_isDownloadRunning &&
-        _downloadCancelToken != null &&
-        _activeDownloadIndex == index) {
-      _isPauseRequested = true;
-      _downloadCancelToken!.cancel('Paused by user');
+    final session = _activeSessions[entry.id];
+    if (session != null) {
+      session.isPauseRequested = true;
+      session.cancelToken.cancel('Paused by user');
       return;
     }
 
-    if (targetFile[2] == 'Queued') {
-      targetFile[2] = 'Paused';
+    if (entry.isQueued || entry.isScheduled) {
+      entry.scheduledAt = null;
+      entry.status = 'Paused';
+      entry.timeLeftText = '—';
       _notify();
 
-      _updateProgressWindowForFile(
-        targetFile,
+      _updateProgressForEntry(
+        entry,
         (current) => current.copyWith(
           status: DownloadProgressStatus.paused,
           speedBytesPerSecond: 0,
@@ -827,56 +1177,52 @@ class DownloadManagerController extends ChangeNotifier {
     }
   }
 
-  void resumeDownloadForFile(List<String> targetFile) {
-    final index = files.indexOf(targetFile);
-    if (index == -1) return;
+  void resumeDownloadById(String entryId) {
+    final entry = findEntryById(entryId);
+    if (entry == null) return;
 
-    selectedFileIndex = index;
+    selectedFileId = entry.id;
     _notify();
-    _startDownloadAt(index);
+    startDownloadById(entry.id);
   }
 
   Future<void> stopSelectedDownload() async {
-    if (files.isEmpty) return;
-    await stopDownloadForFile(files[selectedFileIndex]);
+    final entry = selectedEntry;
+    if (entry == null) return;
+    await stopDownloadById(entry.id);
   }
 
-  Future<void> stopDownloadForFile(List<String> targetFile) async {
-    final index = files.indexOf(targetFile);
-    if (index == -1) return;
+  Future<void> stopDownloadById(String entryId) async {
+    final entry = findEntryById(entryId);
+    if (entry == null || entry.isFinished) return;
 
-    if (targetFile[2] == 'Finished') return;
-
-    if (_isDownloadRunning &&
-        _downloadCancelToken != null &&
-        _activeDownloadIndex == index) {
-      _isPauseRequested = false;
-      _downloadCancelToken!.cancel('Stopped by user');
+    final session = _activeSessions[entry.id];
+    if (session != null) {
+      session.isPauseRequested = false;
+      session.cancelToken.cancel('Stopped by user');
       return;
     }
 
-    final savePath = targetFile.length >= 8 && targetFile[7].isNotEmpty
-        ? targetFile[7]
+    final savePath = entry.savePath.isNotEmpty
+        ? entry.savePath
         : await downloadPathService.getFilePath(
-            fileName: targetFile[0].replaceAll(RegExp(r'[<>:"/\\|?*]'), '_'),
-            category: downloadPathService.getCategoryForFile(targetFile[0]),
+            fileName: entry.fileName.replaceAll(RegExp(r'[<>:"/\\|?*]'), '_'),
+            category: downloadPathService.getCategoryForFile(entry.fileName),
           );
     await downloadService.cleanupPartialFiles(savePath);
 
-    if (targetFile.length >= 7 && targetFile[6].isNotEmpty) {
-      _downloadedBytesByUrl[targetFile[6]] = 0;
-    }
-
     if (_disposed) return;
 
-    targetFile[2] = 'Stopped';
-    targetFile[3] = '—';
-    targetFile[4] = '—';
-    targetFile[5] = '0';
+    entry.scheduledAt = null;
+    entry.status = 'Stopped';
+    entry.speedText = '—';
+    entry.timeLeftText = '—';
+    entry.progressPercent = 0;
+    entry.downloadedBytes = 0;
     _notify();
 
-    _updateProgressWindowForFile(
-      targetFile,
+    _updateProgressForEntry(
+      entry,
       (current) => current.copyWith(
         status: DownloadProgressStatus.stopped,
         downloadedBytes: 0,
@@ -889,100 +1235,96 @@ class DownloadManagerController extends ChangeNotifier {
   }
 
   void retrySelectedDownload() {
-    if (files.isEmpty) return;
-    retryDownloadForFile(files[selectedFileIndex]);
+    final entry = selectedEntry;
+    if (entry == null) return;
+    retryDownloadById(entry.id);
   }
 
-  void retryDownloadForFile(List<String> targetFile) {
-    final index = files.indexOf(targetFile);
-    if (index == -1) return;
+  void retryDownloadById(String entryId) {
+    final entry = findEntryById(entryId);
+    if (entry == null) return;
 
-    final status = targetFile[2];
-    if (status != 'Failed' && status != 'Stopped') {
+    if (!entry.isFailed && !entry.isStopped) {
       _emitMessage('Only failed or stopped downloads can be retried.');
       return;
     }
 
-    selectedFileIndex = index;
+    selectedFileId = entry.id;
     _notify();
-    _startDownloadAt(index);
+    startDownloadById(entry.id);
   }
 
-  void deleteSelectedDownload() {
-    if (files.isEmpty) return;
+  Future<void> deleteSelectedDownload() async {
+    final entry = selectedEntry;
+    if (entry == null) return;
+    await deleteDownloadById(entry.id);
+  }
 
-    final removedIndex = selectedFileIndex;
-    final removedFile = files[removedIndex];
+  Future<void> deleteDownloadById(String entryId) async {
+    final index = files.indexWhere((e) => e.id == entryId);
+    if (index == -1) return;
 
-    if (_isDownloadRunning && _activeDownloadIndex == removedIndex) {
-      _isPauseRequested = false;
-      _downloadCancelToken?.cancel('Deleted by user');
+    final removed = files[index];
+    final session = _activeSessions.remove(removed.id);
+    if (session != null) {
+      session.isPauseRequested = false;
+      session.cancelToken.cancel('Deleted by user');
     }
 
-    files.removeAt(removedIndex);
+    files.removeAt(index);
+    _progressById.remove(removed.id);
 
-    if (_activeDownloadIndex != null) {
-      if (_activeDownloadIndex == removedIndex) {
-        _activeDownloadIndex = null;
-      } else if (removedIndex < _activeDownloadIndex!) {
-        _activeDownloadIndex = _activeDownloadIndex! - 1;
-      }
-    }
-
-    if (identical(_progressWindowFile, removedFile)) {
+    if (_progressWindowEntryId == removed.id) {
       isProgressWindowVisible = false;
-      _progressWindowFile = null;
+      _progressWindowEntryId = null;
       progressNotifier.value = null;
     }
 
-    if (files.isEmpty) {
-      selectedFileIndex = 0;
-    } else if (selectedFileIndex >= files.length) {
-      selectedFileIndex = files.length - 1;
-    }
-
-    _notify();
-  }
-
-  void moveQueuedFile(int oldIndex, int newIndex) {
-    if (oldIndex < 0 || oldIndex >= files.length) return;
-    if (newIndex < 0 || newIndex >= files.length) return;
-    if (oldIndex == newIndex) return;
-
-    if (files[oldIndex][2] != 'Queued' || files[newIndex][2] != 'Queued') {
-      return;
-    }
-
-    final movedFile = files.removeAt(oldIndex);
-    files.insert(newIndex, movedFile);
-
-    if (selectedFileIndex == oldIndex) {
-      selectedFileIndex = newIndex;
-    } else if (oldIndex < selectedFileIndex && newIndex >= selectedFileIndex) {
-      selectedFileIndex--;
-    } else if (oldIndex > selectedFileIndex && newIndex <= selectedFileIndex) {
-      selectedFileIndex++;
-    }
-
-    if (_activeDownloadIndex != null) {
-      if (_activeDownloadIndex == oldIndex) {
-        _activeDownloadIndex = newIndex;
-      } else if (oldIndex < _activeDownloadIndex! &&
-          newIndex >= _activeDownloadIndex!) {
-        _activeDownloadIndex = _activeDownloadIndex! - 1;
-      } else if (oldIndex > _activeDownloadIndex! &&
-          newIndex <= _activeDownloadIndex!) {
-        _activeDownloadIndex = _activeDownloadIndex! + 1;
+    if (selectedFileId == removed.id) {
+      if (files.isEmpty) {
+        selectedFileId = null;
+      } else {
+        final nextIdx = index >= files.length ? files.length - 1 : index;
+        selectedFileId = files[nextIdx].id;
       }
     }
 
+    _notify();
+
+    if (!removed.isFinished && removed.savePath.isNotEmpty) {
+      await downloadService.cleanupPartialFiles(removed.savePath);
+    }
+
+    if (!_disposed &&
+        !scheduleConfig.autoStartQueueEnabled &&
+        _activeSessions.length < maxConcurrentDownloads) {
+      _pumpQueue();
+    }
+  }
+
+  void moveQueuedEntry(String fromId, String toId) {
+    if (fromId == toId) return;
+    final oldIndex = files.indexWhere((e) => e.id == fromId);
+    final newIndex = files.indexWhere((e) => e.id == toId);
+    if (oldIndex == -1 || newIndex == -1) return;
+
+    if (!files[oldIndex].isQueued || !files[newIndex].isQueued) {
+      return;
+    }
+
+    final moved = files.removeAt(oldIndex);
+    files.insert(newIndex, moved);
     _notify();
   }
 
   @override
   void dispose() {
     _disposed = true;
-    _downloadCancelToken?.cancel('Controller disposed');
+    _schedulerTimer?.cancel();
+    for (final session in _activeSessions.values) {
+      session.cancelToken.cancel('Controller disposed');
+    }
+    _activeSessions.clear();
     progressNotifier.dispose();
     super.dispose();
   }

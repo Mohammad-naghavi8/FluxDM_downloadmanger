@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:download_manager/core/theme/app_colors.dart';
 import 'package:download_manager/features/downloads/models/download_file_info.dart';
+import 'package:download_manager/features/downloads/models/download_schedule_config.dart';
 import 'package:download_manager/features/downloads/services/download_path_service.dart';
 import 'package:download_manager/features/downloads/services/download_service.dart';
 import 'package:material_ui/material_ui.dart';
@@ -9,8 +10,15 @@ import 'package:material_ui/material_ui.dart';
 class AddDownloadResult {
   final String url;
   final DownloadFileInfo? fileInfo;
+  final bool startNow;
+  final DateTime? scheduledAt;
 
-  const AddDownloadResult({required this.url, this.fileInfo});
+  const AddDownloadResult({
+    required this.url,
+    this.fileInfo,
+    this.startNow = true,
+    this.scheduledAt,
+  });
 }
 
 class AddDownloadDialog extends StatefulWidget {
@@ -43,6 +51,9 @@ class _AddDownloadDialogState extends State<AddDownloadDialog> {
   String? _infoError;
   int _infoRequestId = 0;
   Timer? _debounceTimer;
+
+  bool _scheduleEnabled = false;
+  DateTime _scheduledAt = DateTime.now().add(const Duration(minutes: 15));
 
   @override
   void initState() {
@@ -144,13 +155,44 @@ class _AddDownloadDialogState extends State<AddDownloadDialog> {
     widget.onDirectoryChanged(newPath);
   }
 
+  Future<void> _pickScheduleTime() async {
+    final now = DateTime.now();
+    final initial = _scheduledAt.isBefore(now) ? now : _scheduledAt;
+
+    final date = await showDatePicker(
+      context: context,
+      initialDate: initial,
+      firstDate: DateTime(now.year, now.month, now.day),
+      lastDate: now.add(const Duration(days: 365)),
+    );
+    if (date == null || !mounted) return;
+
+    final time = await showTimePicker(
+      context: context,
+      initialTime: TimeOfDay.fromDateTime(initial),
+    );
+    if (time == null || !mounted) return;
+
+    setState(() {
+      _scheduledAt = DateTime(
+        date.year,
+        date.month,
+        date.day,
+        time.hour,
+        time.minute,
+      );
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
+    final canSubmit = _enteredUrl.isNotEmpty && !_isLoadingInfo;
+
     return AlertDialog(
       backgroundColor: AppColors.surface,
       title: const Text('Add New Download', style: TextStyle(fontSize: 16)),
       content: SizedBox(
-        width: 420,
+        width: 440,
         child: SingleChildScrollView(
           child: Column(
             mainAxisSize: MainAxisSize.min,
@@ -169,7 +211,7 @@ class _AddDownloadDialogState extends State<AddDownloadDialog> {
                   prefixIcon: Icon(Icons.link),
                 ),
               ),
-              const SizedBox(height: 18),
+              const SizedBox(height: 16),
               if (_isLoadingInfo)
                 const Row(
                   children: [
@@ -187,7 +229,7 @@ class _AddDownloadDialogState extends State<AddDownloadDialog> {
                   'File Information',
                   style: TextStyle(fontWeight: FontWeight.bold),
                 ),
-                const SizedBox(height: 10),
+                const SizedBox(height: 8),
                 _detailRow('File name', _fileInfo!.fileName),
                 _detailRow('File type', _fileInfo!.fileType),
                 _detailRow('File size', _fileInfo!.formattedSize),
@@ -219,19 +261,62 @@ class _AddDownloadDialogState extends State<AddDownloadDialog> {
                   ],
                 ),
               ],
-              const SizedBox(height: 20),
+              const SizedBox(height: 16),
               const Text(
                 'Save location',
                 style: TextStyle(fontWeight: FontWeight.bold),
               ),
-              const SizedBox(height: 8),
+              const SizedBox(height: 6),
               Text(_dialogPath, style: const TextStyle(fontSize: 12)),
-              const SizedBox(height: 10),
+              const SizedBox(height: 8),
               OutlinedButton.icon(
                 onPressed: _browseDirectory,
-                icon: const Icon(Icons.folder_open),
+                icon: const Icon(Icons.folder_open, size: 16),
                 label: const Text('Browse'),
               ),
+              const SizedBox(height: 12),
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                dense: true,
+                activeThumbColor: AppColors.accent,
+                title: const Text(
+                  'Schedule automatic download',
+                  style: TextStyle(fontSize: 12.5),
+                ),
+                value: _scheduleEnabled,
+                onChanged: (value) {
+                  setState(() {
+                    _scheduleEnabled = value;
+                    if (value && !_scheduledAt.isAfter(DateTime.now())) {
+                      _scheduledAt = DateTime.now().add(
+                        const Duration(minutes: 15),
+                      );
+                    }
+                  });
+                },
+              ),
+              if (_scheduleEnabled) ...[
+                Row(
+                  children: [
+                    Expanded(
+                      child: Text(
+                        DownloadScheduleConfig.formatScheduleDateTime(
+                          _scheduledAt,
+                        ),
+                        style: const TextStyle(
+                          color: AppColors.accent,
+                          fontSize: 12.5,
+                        ),
+                      ),
+                    ),
+                    OutlinedButton.icon(
+                      onPressed: _pickScheduleTime,
+                      icon: const Icon(Icons.schedule_rounded, size: 15),
+                      label: const Text('Pick Time'),
+                    ),
+                  ],
+                ),
+              ],
             ],
           ),
         ),
@@ -241,16 +326,37 @@ class _AddDownloadDialogState extends State<AddDownloadDialog> {
           onPressed: () => Navigator.pop(context),
           child: const Text('Cancel'),
         ),
+        if (!_scheduleEnabled)
+          OutlinedButton(
+            onPressed: !canSubmit
+                ? null
+                : () {
+                    Navigator.pop(
+                      context,
+                      AddDownloadResult(
+                        url: _enteredUrl,
+                        fileInfo: _fileInfo,
+                        startNow: false,
+                      ),
+                    );
+                  },
+            child: const Text('Add to Queue'),
+          ),
         ElevatedButton(
-          onPressed: _enteredUrl.isEmpty || _isLoadingInfo
+          onPressed: !canSubmit
               ? null
               : () {
                   Navigator.pop(
                     context,
-                    AddDownloadResult(url: _enteredUrl, fileInfo: _fileInfo),
+                    AddDownloadResult(
+                      url: _enteredUrl,
+                      fileInfo: _fileInfo,
+                      startNow: !_scheduleEnabled,
+                      scheduledAt: _scheduleEnabled ? _scheduledAt : null,
+                    ),
                   );
                 },
-          child: const Text('Start Download'),
+          child: Text(_scheduleEnabled ? 'Schedule' : 'Start Download'),
         ),
       ],
     );
@@ -258,7 +364,7 @@ class _AddDownloadDialogState extends State<AddDownloadDialog> {
 
   Widget _detailRow(String title, String value) {
     return Padding(
-      padding: const EdgeInsets.symmetric(vertical: 5),
+      padding: const EdgeInsets.symmetric(vertical: 4),
       child: Row(
         children: [
           SizedBox(

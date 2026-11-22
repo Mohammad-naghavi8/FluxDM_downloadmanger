@@ -12,6 +12,7 @@ class DownloadProgressWindow extends StatefulWidget {
   final VoidCallback onCancel;
   final VoidCallback onRetry;
   final VoidCallback? onOpenFolder;
+  final ValueChanged<int>? onSpeedLimitChanged;
 
   const DownloadProgressWindow({
     super.key,
@@ -22,6 +23,7 @@ class DownloadProgressWindow extends StatefulWidget {
     required this.onCancel,
     required this.onRetry,
     this.onOpenFolder,
+    this.onSpeedLimitChanged,
   });
 
   @override
@@ -38,12 +40,25 @@ class _DownloadProgressWindowState extends State<DownloadProgressWindow> {
   static const Color _valueColor = Color(0xFFF2F5F3);
 
   bool _showDetails = false;
+  bool _showSpeedLimiter = false;
   Offset? _position;
   final ScrollController _connectionsScrollController = ScrollController();
+  late final TextEditingController _speedLimitController;
+
+  @override
+  void initState() {
+    super.initState();
+    final initialKbps =
+        (widget.state.speedLimitBytesPerSecond ?? (1024 * 1024)) ~/ 1024;
+    _speedLimitController = TextEditingController(
+      text: initialKbps > 0 ? '$initialKbps' : '1024',
+    );
+  }
 
   @override
   void dispose() {
     _connectionsScrollController.dispose();
+    _speedLimitController.dispose();
     super.dispose();
   }
 
@@ -51,6 +66,7 @@ class _DownloadProgressWindowState extends State<DownloadProgressWindow> {
     return switch (status) {
       DownloadProgressStatus.connecting => AppColors.accent,
       DownloadProgressStatus.downloading => AppColors.accent,
+      DownloadProgressStatus.reconnecting => AppColors.paused,
       DownloadProgressStatus.rebuilding => AppColors.accent,
       DownloadProgressStatus.paused => AppColors.paused,
       DownloadProgressStatus.stopped => Colors.redAccent,
@@ -205,6 +221,12 @@ class _DownloadProgressWindowState extends State<DownloadProgressWindow> {
                                       _buildInfoCard(state, statusColor),
                                       const SizedBox(height: 12),
                                       _buildProgressBar(state, statusColor),
+                                      if (_showSpeedLimiter &&
+                                          widget.onSpeedLimitChanged !=
+                                              null) ...[
+                                        const SizedBox(height: 10),
+                                        _buildSpeedLimiterPanel(state),
+                                      ],
                                       if (state.isFailed &&
                                           state.errorMessage != null &&
                                           state.errorMessage!.isNotEmpty) ...[
@@ -285,20 +307,20 @@ class _DownloadProgressWindowState extends State<DownloadProgressWindow> {
             icon: Icons.apps_rounded,
             tooltip: 'Download Status',
             onPressed: () {
-              if (_showDetails) {
-                setState(() => _showDetails = false);
-              }
+              setState(() {
+                _showSpeedLimiter = false;
+              });
             },
           ),
           const SizedBox(height: 6),
           _stripIconButton(
-            icon: Icons.play_circle_outline_rounded,
-            tooltip: state.isPaused ? 'Resume' : 'Pause / Resume',
-            onPressed: state.isActive
-                ? widget.onPause
-                : state.isPaused
-                ? widget.onResume
-                : null,
+            icon: Icons.speed_rounded,
+            tooltip: 'Speed Limiter',
+            onPressed: () {
+              setState(() {
+                _showSpeedLimiter = !_showSpeedLimiter;
+              });
+            },
           ),
           const SizedBox(height: 6),
           _stripIconButton(
@@ -483,6 +505,137 @@ class _DownloadProgressWindowState extends State<DownloadProgressWindow> {
           backgroundColor: _panelBg,
           valueColor: AlwaysStoppedAnimation<Color>(statusColor),
         ),
+      ),
+    );
+  }
+
+  Widget _buildSpeedLimiterPanel(DownloadProgressState state) {
+    final activeLimitBps = state.speedLimitBytesPerSecond ?? 0;
+    final isEnabled = activeLimitBps > 0;
+
+    void applyKbps(int kbps) {
+      final safeKbps = kbps.clamp(16, 1024 * 1024);
+      _speedLimitController.text = '$safeKbps';
+      widget.onSpeedLimitChanged?.call(safeKbps * 1024);
+    }
+
+    return Container(
+      padding: const EdgeInsets.fromLTRB(12, 8, 12, 10),
+      decoration: BoxDecoration(
+        color: _panelBg,
+        borderRadius: BorderRadius.circular(4),
+        border: Border.all(color: _borderColor, width: 1),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(Icons.speed_rounded, color: AppColors.accent, size: 15),
+              const SizedBox(width: 6),
+              const Expanded(
+                child: Text(
+                  'Speed Limiter',
+                  style: TextStyle(
+                    color: _valueColor,
+                    fontSize: 12,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+              Switch(
+                value: isEnabled,
+                activeThumbColor: AppColors.accent,
+                materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                onChanged: (enabled) {
+                  if (!enabled) {
+                    widget.onSpeedLimitChanged?.call(0);
+                  } else {
+                    final parsed =
+                        int.tryParse(_speedLimitController.text.trim()) ?? 1024;
+                    applyKbps(parsed);
+                  }
+                },
+              ),
+            ],
+          ),
+          const SizedBox(height: 6),
+          Row(
+            children: [
+              SizedBox(
+                width: 96,
+                height: 30,
+                child: TextField(
+                  controller: _speedLimitController,
+                  keyboardType: TextInputType.number,
+                  style: const TextStyle(fontSize: 12, color: _valueColor),
+                  decoration: const InputDecoration(
+                    isDense: true,
+                    contentPadding: EdgeInsets.symmetric(
+                      horizontal: 8,
+                      vertical: 6,
+                    ),
+                    suffixText: 'KB/s',
+                    suffixStyle: TextStyle(fontSize: 10.5, color: _labelColor),
+                    border: OutlineInputBorder(
+                      borderSide: BorderSide(color: _borderColor),
+                    ),
+                  ),
+                  onSubmitted: (val) {
+                    final parsed = int.tryParse(val.trim());
+                    if (parsed != null && parsed > 0) {
+                      applyKbps(parsed);
+                    }
+                  },
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Wrap(
+                  spacing: 6,
+                  runSpacing: 4,
+                  children: [
+                    for (final (label, kbps) in const [
+                      ('256 KB/s', 256),
+                      ('512 KB/s', 512),
+                      ('1 MB/s', 1024),
+                      ('2 MB/s', 2048),
+                    ])
+                      InkWell(
+                        onTap: () => applyKbps(kbps),
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 7,
+                            vertical: 4,
+                          ),
+                          decoration: BoxDecoration(
+                            color: activeLimitBps == kbps * 1024
+                                ? AppColors.accentDark
+                                : const Color(0xFF0C100E),
+                            borderRadius: BorderRadius.circular(3),
+                            border: Border.all(
+                              color: activeLimitBps == kbps * 1024
+                                  ? AppColors.accent
+                                  : _borderColor,
+                            ),
+                          ),
+                          child: Text(
+                            label,
+                            style: TextStyle(
+                              fontSize: 10.5,
+                              color: activeLimitBps == kbps * 1024
+                                  ? AppColors.accent
+                                  : _valueColor,
+                            ),
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ],
       ),
     );
   }

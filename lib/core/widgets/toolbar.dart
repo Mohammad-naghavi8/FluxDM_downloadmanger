@@ -8,6 +8,8 @@ class DownloadToolbar extends StatelessWidget {
   final VoidCallback onStop;
   final VoidCallback onRetry;
   final VoidCallback onDelete;
+  final VoidCallback onStartQueue;
+  final VoidCallback onOpenScheduler;
 
   const DownloadToolbar({
     super.key,
@@ -17,6 +19,8 @@ class DownloadToolbar extends StatelessWidget {
     required this.onStop,
     required this.onRetry,
     required this.onDelete,
+    required this.onStartQueue,
+    required this.onOpenScheduler,
   });
 
   @override
@@ -31,7 +35,7 @@ class DownloadToolbar extends StatelessWidget {
           const SizedBox(height: 15),
           _tool(
             Icons.play_circle_outline_sharp,
-            tooltip: 'Start',
+            tooltip: 'Start / Resume',
             onPressed: onStart,
           ),
           _tool(
@@ -39,12 +43,26 @@ class DownloadToolbar extends StatelessWidget {
             tooltip: 'Pause',
             onPressed: onPause,
           ),
-          _tool(Icons.stop_outlined, tooltip: 'Stop', onPressed: onStop),
-          _tool(Icons.close),
+          _tool(Icons.stop_outlined, tooltip: 'Cancel / Stop', onPressed: onStop),
           _tool(Icons.refresh, tooltip: 'Retry', onPressed: onRetry),
           _tool(Icons.delete_outline, tooltip: 'Delete', onPressed: onDelete),
+          const SizedBox(height: 10),
+          _tool(
+            Icons.playlist_play_rounded,
+            tooltip: 'Start Queue',
+            onPressed: onStartQueue,
+          ),
+          _tool(
+            Icons.schedule_rounded,
+            tooltip: 'Scheduler & Concurrency',
+            onPressed: onOpenScheduler,
+          ),
           const Spacer(),
-          _tool(Icons.settings),
+          _tool(
+            Icons.settings,
+            tooltip: 'Queue & Scheduler Settings',
+            onPressed: onOpenScheduler,
+          ),
         ],
       ),
     );

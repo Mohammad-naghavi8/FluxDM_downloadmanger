@@ -4,6 +4,7 @@ import 'dart:io';
 import 'package:dio/dio.dart';
 import 'package:download_manager/features/downloads/models/download_file_info.dart';
 import 'package:download_manager/features/downloads/models/download_progress_state.dart';
+import 'package:download_manager/features/downloads/services/speed_limiter.dart';
 
 class _SegmentSpec {
   final int index;
@@ -62,7 +63,9 @@ class DownloadService {
 
   bool _isRetryableNodeError(Object error) {
     if (error is DioException) {
-      if (error.error is HandshakeException || error.error is SocketException) {
+      if (error.error is HandshakeException ||
+          error.error is SocketException ||
+          error.error is HttpException) {
         return true;
       }
       return error.type == DioExceptionType.badCertificate ||
@@ -70,7 +73,19 @@ class DownloadService {
           error.type == DioExceptionType.connectionTimeout ||
           error.type == DioExceptionType.receiveTimeout;
     }
-    return error is HandshakeException || error is SocketException;
+    return error is HandshakeException ||
+        error is SocketException ||
+        error is HttpException;
+  }
+
+  Duration _reconnectBackoff(int attempt) {
+    return switch (attempt) {
+      <= 1 => const Duration(milliseconds: 600),
+      2 => const Duration(seconds: 1),
+      3 => const Duration(seconds: 2),
+      4 => const Duration(seconds: 3),
+      _ => const Duration(seconds: 5),
+    };
   }
 
   Future<T> _runWithNodeFailover<T>(
@@ -288,7 +303,10 @@ class DownloadService {
     required String url,
     required String savePath,
     required void Function(int received, int total) onProgress,
+    SpeedLimiter? speedLimiter,
+    void Function(int attempt)? onReconnecting,
     CancelToken? cancelToken,
+    int maxReconnectAttempts = 10,
   }) async {
     final uri = Uri.tryParse(url);
 
@@ -299,31 +317,129 @@ class DownloadService {
     }
 
     final file = File(savePath);
-
     await file.parent.create(recursive: true);
 
     final stopwatch = Stopwatch()..start();
     var lastEmitMs = -200;
+    int received = 0;
+    int total = -1;
+    bool serverSupportsRange = false;
+    int attempt = 0;
 
-    await _runWithNodeFailover(
-      uri,
-      () => _dio.download(
-        url,
-        savePath,
-        cancelToken: cancelToken,
-        deleteOnError: false,
-        onReceiveProgress: (received, total) {
+    while (true) {
+      if (cancelToken?.isCancelled ?? false) {
+        throw DioException.requestCancelled(
+          requestOptions: RequestOptions(path: url),
+          reason: cancelToken?.cancelError?.error ?? 'Cancelled',
+        );
+      }
+
+      final isResumingAfterDrop = received > 0 && serverSupportsRange;
+      IOSink? sink;
+
+      try {
+        final response = await _dio.get<ResponseBody>(
+          url,
+          options: Options(
+            responseType: ResponseType.stream,
+            followRedirects: true,
+            headers: isResumingAfterDrop
+                ? {'Range': 'bytes=$received-'}
+                : null,
+            validateStatus: (status) => isResumingAfterDrop
+                ? status == 206
+                : (status != null && status >= 200 && status < 300),
+          ),
+          cancelToken: cancelToken,
+        );
+
+        final acceptRanges = response.headers.value('accept-ranges');
+        if (acceptRanges?.toLowerCase() == 'bytes' ||
+            response.statusCode == 206) {
+          serverSupportsRange = true;
+        }
+
+        if (isResumingAfterDrop) {
+          final contentRange = response.headers.value('content-range');
+          if (contentRange != null && contentRange.contains('/')) {
+            final parsedTotal = int.tryParse(contentRange.split('/').last);
+            if (parsedTotal != null && parsedTotal > 0) {
+              total = parsedTotal;
+            }
+          }
+        } else {
+          received = 0;
+          final contentLength = response.headers.value('content-length');
+          total = int.tryParse(contentLength ?? '') ?? -1;
+        }
+
+        sink = file.openWrite(
+          mode: isResumingAfterDrop ? FileMode.append : FileMode.write,
+        );
+
+        await for (final chunk in response.data!.stream) {
+          if (cancelToken?.isCancelled ?? false) {
+            throw DioException.requestCancelled(
+              requestOptions: response.requestOptions,
+              reason: cancelToken?.cancelError?.error ?? 'Cancelled',
+            );
+          }
+
+          sink.add(chunk);
+          received += chunk.length;
+
           final nowMs = stopwatch.elapsedMilliseconds;
           final isComplete = total > 0 && received >= total;
-          if (!isComplete && nowMs - lastEmitMs < 150) {
-            return;
+          if (isComplete || nowMs - lastEmitMs >= 150) {
+            lastEmitMs = nowMs;
+            onProgress(received, total);
           }
-          lastEmitMs = nowMs;
-          onProgress(received, total);
-        },
-      ),
-      cancelToken: cancelToken,
-    );
+
+          if (speedLimiter != null) {
+            await speedLimiter.throttle(chunk.length, cancelToken: cancelToken);
+          }
+        }
+
+        await sink.flush();
+        await sink.close();
+        sink = null;
+
+        if (total > 0 && received < total) {
+          throw const HttpException('Connection closed prematurely');
+        }
+
+        onProgress(received, total > 0 ? total : received);
+        return;
+      } catch (error) {
+        if (sink != null) {
+          try {
+            await sink.flush();
+          } catch (_) {}
+          try {
+            await sink.close();
+          } catch (_) {}
+          sink = null;
+        }
+
+        final isCancelled =
+            (cancelToken?.isCancelled ?? false) ||
+            (error is DioException && error.type == DioExceptionType.cancel);
+
+        if (isCancelled ||
+            !_isRetryableNodeError(error) ||
+            attempt >= maxReconnectAttempts) {
+          rethrow;
+        }
+
+        attempt++;
+        onReconnecting?.call(attempt);
+        _resetClient();
+        await SpeedLimiter.cancellableDelay(
+          _reconnectBackoff(attempt),
+          cancelToken: cancelToken,
+        );
+      }
+    }
   }
 
   Future<void> downloadFileSegmented({
@@ -339,10 +455,13 @@ class DownloadService {
       List<DownloadConnectionProgress> connections,
     )?
     onSegmentedProgress,
+    void Function(int attempt)? onReconnecting,
     void Function()? onRebuilding,
+    SpeedLimiter? speedLimiter,
     CancelToken? cancelToken,
     int connectionCount = defaultConnectionCount,
     bool resumeExisting = false,
+    int maxReconnectAttempts = 10,
   }) async {
     final uri = Uri.tryParse(url);
 
@@ -494,7 +613,7 @@ class DownloadService {
         return;
       }
 
-      const maxRetries = 4;
+      final maxRetries = maxReconnectAttempts;
       int attempt = 0;
 
       while (true) {
@@ -519,7 +638,9 @@ class DownloadService {
         final rangeEnd = spec.endByte;
 
         segDownloaded[idx] = currentSaved;
-        segInfo[idx] = attempt == 0 ? 'Connecting...' : 'Reconnecting...';
+        segInfo[idx] = attempt == 0
+            ? 'Connecting...'
+            : 'Reconnecting ($attempt/$maxRetries)...';
         segActive[idx] = true;
         segError[idx] = false;
         emitProgress(force: true);
@@ -572,6 +693,13 @@ class DownloadService {
             segDownloaded[idx] = currentSaved;
             emitProgress();
 
+            if (speedLimiter != null) {
+              await speedLimiter.throttle(
+                bytesToWrite.length,
+                cancelToken: sharedCancelToken,
+              );
+            }
+
             if (currentSaved >= spec.length) break;
           }
 
@@ -591,7 +719,13 @@ class DownloadService {
 
           if (attempt < maxRetries && !sharedCancelToken.isCancelled) {
             attempt++;
-            await Future<void>.delayed(const Duration(milliseconds: 350));
+            segInfo[idx] = 'Reconnecting ($attempt/$maxRetries)...';
+            emitProgress(force: true);
+            onReconnecting?.call(attempt);
+            await SpeedLimiter.cancellableDelay(
+              _reconnectBackoff(attempt),
+              cancelToken: sharedCancelToken,
+            );
             continue;
           }
 
@@ -623,12 +757,17 @@ class DownloadService {
             rethrow;
           }
 
-          if (attempt < maxRetries) {
-            if (_isRetryableNodeError(error)) {
-              _resetClient();
-            }
+          if (attempt < maxRetries && _isRetryableNodeError(error)) {
             attempt++;
-            await Future<void>.delayed(const Duration(milliseconds: 450));
+            _resetClient();
+            segDownloaded[idx] = currentSaved.clamp(0, spec.length);
+            segInfo[idx] = 'Waiting for network ($attempt/$maxRetries)...';
+            emitProgress(force: true);
+            onReconnecting?.call(attempt);
+            await SpeedLimiter.cancellableDelay(
+              _reconnectBackoff(attempt),
+              cancelToken: sharedCancelToken,
+            );
             continue;
           }
 
@@ -776,7 +915,10 @@ class DownloadService {
     required String savePath,
     required int downloadedBytes,
     required void Function(int received, int total) onProgress,
+    SpeedLimiter? speedLimiter,
+    void Function(int attempt)? onReconnecting,
     CancelToken? cancelToken,
+    int maxReconnectAttempts = 10,
   }) async {
     final file = File(savePath);
 
@@ -794,55 +936,108 @@ class DownloadService {
       throw Exception('Downloaded file size does not match resume position');
     }
 
-    final uri = Uri.parse(url);
-    final response = await _runWithNodeFailover(
-      uri,
-      () => _dio.get<ResponseBody>(
-        url,
-        options: Options(
-          responseType: ResponseType.stream,
-          headers: {'Range': 'bytes=$downloadedBytes-'},
-          validateStatus: (status) => status == 206,
-        ),
-        cancelToken: cancelToken,
-      ),
-      cancelToken: cancelToken,
-    );
-
-    final contentRange = response.headers.value('content-range');
-
-    if (contentRange == null ||
-        !contentRange.startsWith('bytes $downloadedBytes-')) {
-      throw Exception('Server returned an invalid Content-Range');
-    }
-
-    final total = int.tryParse(contentRange.split('/').last);
-
-    if (total == null) {
-      throw Exception('Could not determine file size');
-    }
-
-    final sink = file.openWrite(mode: FileMode.append);
     final stopwatch = Stopwatch()..start();
     var lastEmitMs = -200;
-
     var received = downloadedBytes;
+    int? total;
+    int attempt = 0;
 
-    try {
-      await for (final chunk in response.data!.stream) {
-        sink.add(chunk);
-        received += chunk.length;
-        final nowMs = stopwatch.elapsedMilliseconds;
-        if (received >= total || nowMs - lastEmitMs >= 150) {
-          lastEmitMs = nowMs;
-          onProgress(received, total);
-        }
+    while (true) {
+      if (cancelToken?.isCancelled ?? false) {
+        throw DioException.requestCancelled(
+          requestOptions: RequestOptions(path: url),
+          reason: cancelToken?.cancelError?.error ?? 'Cancelled',
+        );
       }
 
-      await sink.flush();
-      onProgress(received, total);
-    } finally {
-      await sink.close();
+      IOSink? sink;
+      try {
+        final response = await _dio.get<ResponseBody>(
+          url,
+          options: Options(
+            responseType: ResponseType.stream,
+            followRedirects: true,
+            headers: {'Range': 'bytes=$received-'},
+            validateStatus: (status) => status == 206,
+          ),
+          cancelToken: cancelToken,
+        );
+
+        final contentRange = response.headers.value('content-range');
+
+        if (contentRange == null ||
+            !contentRange.startsWith('bytes $received-')) {
+          throw Exception('Server returned an invalid Content-Range');
+        }
+
+        total = int.tryParse(contentRange.split('/').last);
+
+        if (total == null) {
+          throw Exception('Could not determine file size');
+        }
+
+        sink = file.openWrite(mode: FileMode.append);
+
+        await for (final chunk in response.data!.stream) {
+          if (cancelToken?.isCancelled ?? false) {
+            throw DioException.requestCancelled(
+              requestOptions: response.requestOptions,
+              reason: cancelToken?.cancelError?.error ?? 'Cancelled',
+            );
+          }
+
+          sink.add(chunk);
+          received += chunk.length;
+          final nowMs = stopwatch.elapsedMilliseconds;
+          if (received >= total || nowMs - lastEmitMs >= 150) {
+            lastEmitMs = nowMs;
+            onProgress(received, total);
+          }
+
+          if (speedLimiter != null) {
+            await speedLimiter.throttle(chunk.length, cancelToken: cancelToken);
+          }
+        }
+
+        await sink.flush();
+        await sink.close();
+        sink = null;
+
+        if (received < total) {
+          throw const HttpException('Connection closed prematurely');
+        }
+
+        onProgress(received, total);
+        return;
+      } catch (error) {
+        if (sink != null) {
+          try {
+            await sink.flush();
+          } catch (_) {}
+          try {
+            await sink.close();
+          } catch (_) {}
+          sink = null;
+        }
+
+        final isCancelled =
+            (cancelToken?.isCancelled ?? false) ||
+            (error is DioException && error.type == DioExceptionType.cancel);
+
+        if (isCancelled ||
+            !_isRetryableNodeError(error) ||
+            attempt >= maxReconnectAttempts) {
+          rethrow;
+        }
+
+        attempt++;
+        onReconnecting?.call(attempt);
+        _resetClient();
+        await SpeedLimiter.cancellableDelay(
+          _reconnectBackoff(attempt),
+          cancelToken: cancelToken,
+        );
+      }
     }
   }
 }

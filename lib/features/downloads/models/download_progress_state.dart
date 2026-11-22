@@ -1,6 +1,7 @@
 enum DownloadProgressStatus {
   connecting,
   downloading,
+  reconnecting,
   rebuilding,
   paused,
   stopped,
@@ -69,6 +70,7 @@ class DownloadProgressState {
   final bool isResumedTransfer;
   final int resumeStartBytes;
   final List<DownloadConnectionProgress> connectionSegments;
+  final int? speedLimitBytesPerSecond;
   final String? errorMessage;
   final DateTime startedAt;
 
@@ -86,6 +88,7 @@ class DownloadProgressState {
     this.isResumedTransfer = false,
     this.resumeStartBytes = 0,
     this.connectionSegments = const [],
+    this.speedLimitBytesPerSecond,
     this.errorMessage,
     required this.startedAt,
   });
@@ -93,6 +96,7 @@ class DownloadProgressState {
   bool get isActive =>
       status == DownloadProgressStatus.connecting ||
       status == DownloadProgressStatus.downloading ||
+      status == DownloadProgressStatus.reconnecting ||
       status == DownloadProgressStatus.rebuilding;
 
   bool get isPaused => status == DownloadProgressStatus.paused;
@@ -137,6 +141,7 @@ class DownloadProgressState {
     return switch (status) {
       DownloadProgressStatus.connecting => 'Connecting...',
       DownloadProgressStatus.downloading => 'Receiving data...',
+      DownloadProgressStatus.reconnecting => 'Reconnecting...',
       DownloadProgressStatus.rebuilding => 'Rebuilding file...',
       DownloadProgressStatus.paused => 'Paused',
       DownloadProgressStatus.stopped => 'Stopped',
@@ -156,9 +161,14 @@ class DownloadProgressState {
 
   String get formattedTransferRate {
     if (status == DownloadProgressStatus.connecting) return 'Connecting...';
+    if (status == DownloadProgressStatus.reconnecting) return 'Reconnecting...';
     if (status != DownloadProgressStatus.downloading) return '—';
-    if (speedBytesPerSecond <= 0) return 'Calculating...';
-    return formatSpeed(speedBytesPerSecond);
+    final limitSuffix =
+        speedLimitBytesPerSecond != null && speedLimitBytesPerSecond! > 0
+        ? ' (limit ${formatSpeed(speedLimitBytesPerSecond!.toDouble())})'
+        : '';
+    if (speedBytesPerSecond <= 0) return 'Calculating...$limitSuffix';
+    return '${formatSpeed(speedBytesPerSecond)}$limitSuffix';
   }
 
   String get formattedTimeLeft {
@@ -204,6 +214,7 @@ class DownloadProgressState {
             ? 'Receiving data... (${formatSpeed(speedBytesPerSecond)})'
             : 'Receiving data...',
       DownloadProgressStatus.rebuilding => 'Rebuilding file...',
+      DownloadProgressStatus.reconnecting => 'Waiting for network... Reconnecting...',
       DownloadProgressStatus.paused =>
         'Disconnected (Paused at ${formatBytes(downloadedBytes)})',
       DownloadProgressStatus.stopped => 'Disconnected (Stopped)',
@@ -267,6 +278,8 @@ class DownloadProgressState {
     bool? isResumedTransfer,
     int? resumeStartBytes,
     List<DownloadConnectionProgress>? connectionSegments,
+    int? speedLimitBytesPerSecond,
+    bool clearSpeedLimit = false,
     String? errorMessage,
     bool clearErrorMessage = false,
     DateTime? startedAt,
@@ -287,6 +300,9 @@ class DownloadProgressState {
       isResumedTransfer: isResumedTransfer ?? this.isResumedTransfer,
       resumeStartBytes: resumeStartBytes ?? this.resumeStartBytes,
       connectionSegments: connectionSegments ?? this.connectionSegments,
+      speedLimitBytesPerSecond: clearSpeedLimit
+          ? null
+          : (speedLimitBytesPerSecond ?? this.speedLimitBytesPerSecond),
       errorMessage: clearErrorMessage
           ? null
           : (errorMessage ?? this.errorMessage),

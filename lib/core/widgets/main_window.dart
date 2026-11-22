@@ -6,6 +6,7 @@ import 'package:download_manager/features/downloads/models/download_progress_sta
 import 'package:download_manager/features/downloads/widgets/add_download_dialog.dart';
 import 'package:download_manager/features/downloads/widgets/download_list_view.dart';
 import 'package:download_manager/features/downloads/widgets/download_progress_window.dart';
+import 'package:download_manager/features/downloads/widgets/scheduler_dialog.dart';
 import 'package:flutter/services.dart';
 import 'package:material_ui/material_ui.dart';
 
@@ -27,7 +28,7 @@ class _MainWindowState extends State<MainWindow> with ClipboardListener {
     _controller = DownloadManagerController(onMessage: _showSnackBar);
     clipboardWatcher.addListener(this);
     clipboardWatcher.start();
-    _controller.loadDownloadDirectory();
+    _controller.initialize();
   }
 
   @override
@@ -40,9 +41,9 @@ class _MainWindowState extends State<MainWindow> with ClipboardListener {
 
   void _showSnackBar(String message) {
     if (!mounted) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text(message)),
-    );
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text(message)));
   }
 
   @override
@@ -90,7 +91,38 @@ class _MainWindowState extends State<MainWindow> with ClipboardListener {
 
     if (!mounted || result == null || result.url.isEmpty) return;
 
-    await _controller.addDownload(url: result.url, fileInfo: result.fileInfo);
+    await _controller.addDownload(
+      url: result.url,
+      fileInfo: result.fileInfo,
+      startNow: result.startNow,
+      scheduledAt: result.scheduledAt,
+    );
+  }
+
+  Future<void> _showSchedulerDialog() async {
+    final selected = _controller.selectedEntry;
+
+    final result = await showDialog<SchedulerDialogResult>(
+      context: context,
+      builder: (_) => SchedulerDialog(
+        initialConfig: _controller.scheduleConfig,
+        selectedEntry: selected,
+        queuedCount: _controller.queuedCount,
+        activeCount: _controller.activeDownloadCount,
+        onStartQueueNow: _controller.startQueue,
+        onPauseAll: _controller.pauseAllDownloads,
+      ),
+    );
+
+    if (!mounted || result == null) return;
+
+    await _controller.updateScheduleConfig(result.config);
+
+    if (result.updateSelectedEntrySchedule && selected != null) {
+      _controller.scheduleEntry(selected.id, result.selectedEntrySchedule);
+    } else {
+      _showSnackBar('Scheduler settings saved');
+    }
   }
 
   @override
@@ -107,6 +139,8 @@ class _MainWindowState extends State<MainWindow> with ClipboardListener {
                 onStop: _controller.stopSelectedDownload,
                 onRetry: _controller.retrySelectedDownload,
                 onDelete: _controller.deleteSelectedDownload,
+                onStartQueue: _controller.startQueue,
+                onOpenScheduler: _showSchedulerDialog,
               ),
               Expanded(
                 child: ListenableBuilder(
@@ -123,12 +157,17 @@ class _MainWindowState extends State<MainWindow> with ClipboardListener {
                         Expanded(
                           child: DownloadListView(
                             selectedCategory: _controller.selectedCategory,
-                            files: _controller.files,
-                            selectedFileIndex: _controller.selectedFileIndex,
-                            onSelectFile: _controller.selectFile,
+                            files: _controller.visibleFiles,
+                            totalCount: _controller.files.length,
+                            activeCount: _controller.activeDownloadCount,
+                            maxConcurrent: _controller.maxConcurrentDownloads,
+                            scheduleConfig: _controller.scheduleConfig,
+                            selectedFileId: _controller.selectedFileId,
+                            onSearchChanged: _controller.updateSearchQuery,
+                            onSelectFile: _controller.selectFileById,
                             onOpenProgress:
                                 _controller.openExistingProgressWindow,
-                            onMoveQueuedFile: _controller.moveQueuedFile,
+                            onMoveQueuedEntry: _controller.moveQueuedEntry,
                           ),
                         ),
                       ],
@@ -152,34 +191,40 @@ class _MainWindowState extends State<MainWindow> with ClipboardListener {
                     return const SizedBox.shrink();
                   }
 
-                  final targetFile = _controller.progressWindowFile;
+                  final targetId = _controller.progressWindowEntryId;
 
                   return DownloadProgressWindow(
                     state: progressState,
                     onClose: _controller.closeProgressWindow,
                     onPause: () {
-                      if (targetFile != null) {
-                        _controller.pauseDownloadForFile(targetFile);
+                      if (targetId != null) {
+                        _controller.pauseDownloadById(targetId);
                       }
                     },
                     onResume: () {
-                      if (targetFile != null) {
-                        _controller.resumeDownloadForFile(targetFile);
+                      if (targetId != null) {
+                        _controller.resumeDownloadById(targetId);
                       }
                     },
                     onCancel: () {
-                      if (targetFile != null) {
-                        _controller.stopDownloadForFile(targetFile);
+                      if (targetId != null) {
+                        _controller.stopDownloadById(targetId);
                       }
                     },
                     onRetry: () {
-                      if (targetFile != null) {
-                        _controller.retryDownloadForFile(targetFile);
+                      if (targetId != null) {
+                        _controller.retryDownloadById(targetId);
                       }
                     },
                     onOpenFolder: progressState.savePath.isNotEmpty
                         ? () => _controller.openFolderForPath(
                             progressState.savePath,
+                          )
+                        : null,
+                    onSpeedLimitChanged: targetId != null
+                        ? (bytesPerSec) => _controller.setEntrySpeedLimit(
+                            targetId,
+                            bytesPerSec,
                           )
                         : null,
                   );

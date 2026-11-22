@@ -1,26 +1,58 @@
 import 'package:download_manager/core/theme/app_colors.dart';
+import 'package:download_manager/features/downloads/models/download_entry.dart';
+import 'package:download_manager/features/downloads/models/download_schedule_config.dart';
 import 'package:material_ui/material_ui.dart';
 
 class DownloadListView extends StatelessWidget {
   final String selectedCategory;
-  final List<List<String>> files;
-  final int selectedFileIndex;
-  final ValueChanged<int> onSelectFile;
-  final ValueChanged<int> onOpenProgress;
-  final void Function(int oldIndex, int newIndex) onMoveQueuedFile;
+  final List<DownloadEntry> files;
+  final int totalCount;
+  final int activeCount;
+  final int maxConcurrent;
+  final DownloadScheduleConfig scheduleConfig;
+  final String? selectedFileId;
+  final ValueChanged<String> onSearchChanged;
+  final ValueChanged<String> onSelectFile;
+  final ValueChanged<String> onOpenProgress;
+  final void Function(String fromId, String toId) onMoveQueuedEntry;
 
   const DownloadListView({
     super.key,
     required this.selectedCategory,
     required this.files,
-    required this.selectedFileIndex,
+    required this.totalCount,
+    required this.activeCount,
+    required this.maxConcurrent,
+    required this.scheduleConfig,
+    required this.selectedFileId,
+    required this.onSearchChanged,
     required this.onSelectFile,
     required this.onOpenProgress,
-    required this.onMoveQueuedFile,
+    required this.onMoveQueuedEntry,
   });
 
   @override
   Widget build(BuildContext context) {
+    final footerParts = <String>[
+      '$totalCount ${totalCount == 1 ? 'file' : 'files'}',
+      'Active: $activeCount/$maxConcurrent',
+      'Segments: ${scheduleConfig.segmentsPerDownload}',
+    ];
+    if (scheduleConfig.speedLimitEnabled && scheduleConfig.speedLimitKBps > 0) {
+      footerParts.add('Speed limit: ${scheduleConfig.speedLimitKBps} KB/s');
+    }
+    if (scheduleConfig.autoStartQueueEnabled &&
+        scheduleConfig.queueStartTime != null) {
+      footerParts.add(
+        'Auto-start: ${DownloadScheduleConfig.formatScheduleDateTime(scheduleConfig.queueStartTime)}',
+      );
+    }
+    if (scheduleConfig.autoStopEnabled && scheduleConfig.queueStopTime != null) {
+      footerParts.add(
+        'Auto-pause: ${DownloadScheduleConfig.formatScheduleDateTime(scheduleConfig.queueStopTime)}',
+      );
+    }
+
     return Padding(
       padding: const EdgeInsets.all(16),
       child: Column(
@@ -40,6 +72,7 @@ class DownloadListView extends StatelessWidget {
               SizedBox(
                 width: 220,
                 child: TextField(
+                  onChanged: onSearchChanged,
                   decoration: InputDecoration(
                     hintText: 'Search files',
                     prefixIcon: const Icon(Icons.search),
@@ -88,16 +121,17 @@ class DownloadListView extends StatelessWidget {
                 : ListView.builder(
                     itemCount: files.length,
                     itemBuilder: (context, index) {
-                      final file = files[index];
-                      if (file[2] == 'Queued') {
-                        return _buildQueueRow(file, index);
+                      final entry = files[index];
+                      if (entry.isQueued) {
+                        return _buildQueueRow(entry);
                       }
-                      return _buildFileRow(file, index);
+                      return _buildFileRow(entry);
                     },
                   ),
           ),
+          const SizedBox(height: 6),
           Text(
-            '${files.length} files',
+            footerParts.join('  •  '),
             style: const TextStyle(
               color: AppColors.textSecondary,
               fontSize: 12,
@@ -108,25 +142,26 @@ class DownloadListView extends StatelessWidget {
     );
   }
 
-  Widget _buildFileRow(List<String> file, int index) {
-    final status = file[2];
-    final progress = (double.tryParse(file[5]) ?? 0) / 100;
+  Widget _buildFileRow(DownloadEntry entry) {
+    final status = entry.status;
+    final progress = (entry.progressPercent / 100).clamp(0.0, 1.0);
 
     final progressColor = switch (status) {
       'Downloading' => AppColors.accent,
       'Paused' => AppColors.paused,
       'Queued' => Colors.cyanAccent,
+      'Scheduled' => AppColors.video,
       'Stopped' => Colors.redAccent,
       'Failed' => Colors.redAccent,
       'Finished' => Colors.greenAccent,
       _ => AppColors.textSecondary,
     };
 
-    final selected = selectedFileIndex == index;
+    final selected = selectedFileId == entry.id;
 
     return GestureDetector(
-      onTap: () => onSelectFile(index),
-      onDoubleTap: () => onOpenProgress(index),
+      onTap: () => onSelectFile(entry.id),
+      onDoubleTap: () => onOpenProgress(entry.id),
       child: Container(
         height: 58,
         padding: const EdgeInsets.symmetric(horizontal: 8),
@@ -142,15 +177,19 @@ class DownloadListView extends StatelessWidget {
               flex: 5,
               child: Row(
                 children: [
-                  const Icon(
-                    Icons.insert_drive_file_outlined,
-                    color: AppColors.accent,
+                  Icon(
+                    entry.isScheduled
+                        ? Icons.schedule_rounded
+                        : Icons.insert_drive_file_outlined,
+                    color: entry.isScheduled
+                        ? AppColors.video
+                        : AppColors.accent,
                     size: 18,
                   ),
                   const SizedBox(width: 10),
                   Expanded(
                     child: Text(
-                      file[0],
+                      entry.fileName,
                       overflow: TextOverflow.ellipsis,
                       style: const TextStyle(fontSize: 12),
                     ),
@@ -160,7 +199,7 @@ class DownloadListView extends StatelessWidget {
             ),
             Expanded(
               flex: 1,
-              child: Text(file[1], style: const TextStyle(fontSize: 11)),
+              child: Text(entry.sizeText, style: const TextStyle(fontSize: 11)),
             ),
             Expanded(
               flex: 2,
@@ -171,11 +210,18 @@ class DownloadListView extends StatelessWidget {
             ),
             Expanded(
               flex: 1,
-              child: Text(file[3], style: const TextStyle(fontSize: 11)),
+              child: Text(
+                entry.speedText,
+                style: const TextStyle(fontSize: 11),
+              ),
             ),
             Expanded(
               flex: 1,
-              child: Text(file[4], style: const TextStyle(fontSize: 11)),
+              child: Text(
+                entry.timeLeftText,
+                overflow: TextOverflow.ellipsis,
+                style: const TextStyle(fontSize: 11),
+              ),
             ),
             Expanded(
               flex: 2,
@@ -186,7 +232,7 @@ class DownloadListView extends StatelessWidget {
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
-                      '${file[5]}%',
+                      '${entry.progressPercent}%',
                       style: TextStyle(fontSize: 10, color: progressColor),
                     ),
                     const SizedBox(height: 5),
@@ -209,22 +255,15 @@ class DownloadListView extends StatelessWidget {
     );
   }
 
-  Widget _buildQueueRow(List<String> file, int index) {
-    return DragTarget<int>(
-      onWillAcceptWithDetails: (details) {
-        final fromIndex = details.data;
-
-        return fromIndex != index &&
-            fromIndex >= 0 &&
-            fromIndex < files.length &&
-            files[fromIndex][2] == 'Queued';
-      },
+  Widget _buildQueueRow(DownloadEntry entry) {
+    return DragTarget<String>(
+      onWillAcceptWithDetails: (details) => details.data != entry.id,
       onAcceptWithDetails: (details) {
-        onMoveQueuedFile(details.data, index);
+        onMoveQueuedEntry(details.data, entry.id);
       },
       builder: (context, candidates, rejected) {
-        return LongPressDraggable<int>(
-          data: index,
+        return LongPressDraggable<String>(
+          data: entry.id,
           feedback: Material(
             color: AppColors.surface,
             elevation: 8,
@@ -233,7 +272,7 @@ class DownloadListView extends StatelessWidget {
               child: Padding(
                 padding: const EdgeInsets.all(12),
                 child: Text(
-                  file[0],
+                  entry.fileName,
                   style: const TextStyle(
                     color: AppColors.textPrimary,
                     fontSize: 12,
@@ -244,13 +283,13 @@ class DownloadListView extends StatelessWidget {
           ),
           childWhenDragging: Opacity(
             opacity: 0.3,
-            child: _buildFileRow(file, index),
+            child: _buildFileRow(entry),
           ),
           child: Container(
             decoration: candidates.isNotEmpty
                 ? BoxDecoration(border: Border.all(color: AppColors.accent))
                 : null,
-            child: _buildFileRow(file, index),
+            child: _buildFileRow(entry),
           ),
         );
       },

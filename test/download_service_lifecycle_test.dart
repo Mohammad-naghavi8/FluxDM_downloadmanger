@@ -2,6 +2,7 @@ import 'dart:io';
 
 import 'package:dio/dio.dart';
 import 'package:download_manager/features/downloads/services/download_service.dart';
+import 'package:download_manager/features/downloads/services/speed_limiter.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
@@ -18,12 +19,28 @@ void main() {
       payload = List<int>.generate(256 * 1024, (i) => i % 251);
 
       server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      bool droppedOnce = false;
       server.listen((HttpRequest request) async {
         final path = request.uri.path;
 
         if (path == '/fail') {
           request.response.statusCode = HttpStatus.notFound;
           await request.response.close();
+          return;
+        }
+
+        if (path == '/flaky.bin' &&
+            request.method == 'GET' &&
+            !droppedOnce) {
+          droppedOnce = true;
+          request.response.statusCode = HttpStatus.ok;
+          request.response.headers.set('accept-ranges', 'bytes');
+          request.response.headers.set('content-length', payload.length);
+          // Detach raw socket after sending headers, write 32 KB, then drop TCP
+          final socket = await request.response.detachSocket(writeHeaders: true);
+          socket.add(payload.sublist(0, 32 * 1024));
+          await socket.flush();
+          socket.destroy();
           return;
         }
 
@@ -205,5 +222,49 @@ void main() {
         expect(savedBytes, equals(payload));
       },
     );
+
+    test(
+      'auto-reconnects and resumes seamlessly after unexpected network drop',
+      () async {
+        final url = 'http://127.0.0.1:${server.port}/flaky.bin';
+        final savePath = '${tempDir.path}${Platform.pathSeparator}flaky.bin';
+
+        int reconnectCalls = 0;
+
+        await service.downloadFile(
+          url: url,
+          savePath: savePath,
+          onReconnecting: (_) => reconnectCalls++,
+          onProgress: (_, _) {},
+        );
+
+        expect(reconnectCalls, greaterThanOrEqualTo(1));
+        final savedBytes = await File(savePath).readAsBytes();
+        expect(savedBytes, equals(payload));
+      },
+    );
+
+    test('enforces real-time speed limit without corrupting data', () async {
+      final url = 'http://127.0.0.1:${server.port}/sample.bin';
+      final savePath = '${tempDir.path}${Platform.pathSeparator}limited.bin';
+
+      // Limit 256 KB payload to 256 KB/s -> should throttle smoothly (~500ms+)
+      final limiter = SpeedLimiter(() => 256 * 1024);
+      final sw = Stopwatch()..start();
+
+      await service.downloadFileSegmented(
+        url: url,
+        savePath: savePath,
+        totalBytes: payload.length,
+        connectionCount: 4,
+        speedLimiter: limiter,
+        onProgress: (_, _) {},
+      );
+      sw.stop();
+
+      expect(sw.elapsedMilliseconds, greaterThanOrEqualTo(450));
+      final savedBytes = await File(savePath).readAsBytes();
+      expect(savedBytes, equals(payload));
+    });
   });
 }
