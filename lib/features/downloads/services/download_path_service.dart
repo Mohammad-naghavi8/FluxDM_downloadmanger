@@ -17,6 +17,35 @@ class DownloadPathService {
     'Others': 'Others',
   };
 
+  String getCategoryForFile(String fileName) {
+    final extension = fileName.split('.').last.toLowerCase();
+
+    const programs = {'exe', 'msi', 'msix', 'appx', 'apk'};
+    const videos = {'mp4', 'mkv', 'avi', 'mov', 'wmv', 'webm'};
+    const music = {'mp3', 'wav', 'flac', 'aac', 'ogg', 'm4a'};
+    const documents = {
+      'pdf',
+      'doc',
+      'docx',
+      'txt',
+      'xls',
+      'xlsx',
+      'ppt',
+      'pptx',
+    };
+    const images = {'jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp'};
+    const compressed = {'zip', 'rar', '7z', 'tar', 'gz'};
+
+    if (programs.contains(extension)) return 'Programs';
+    if (videos.contains(extension)) return 'Videos';
+    if (music.contains(extension)) return 'Music';
+    if (documents.contains(extension)) return 'Documents';
+    if (images.contains(extension)) return 'Images';
+    if (compressed.contains(extension)) return 'Compressed';
+
+    return 'Others';
+  }
+
   Future<String> getDefaultPath() async {
     final home =
         Platform.environment['USERPROFILE'] ?? Platform.environment['HOME'];
@@ -45,14 +74,15 @@ class DownloadPathService {
   }
 
   Future<bool> chooseDirectory() async {
-    final currentPath = await getSavedPath();
+    final result = await FilePicker.pickDirectory();
 
-    final selectedPath = await FilePicker.getDirectoryPath(
-      dialogTitle: 'Select Download Folder',
-      initialDirectory: currentPath,
-    );
+    if (result == null) {
+      return false;
+    }
 
-    if (selectedPath == null || selectedPath.isEmpty) {
+    final selectedPath = result.path;
+
+    if (selectedPath.isEmpty) {
       return false;
     }
 

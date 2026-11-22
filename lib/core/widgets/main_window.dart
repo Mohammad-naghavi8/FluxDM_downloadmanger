@@ -1,5 +1,6 @@
 import 'dart:io';
 
+import 'package:download_manager/features/downloads/services/download_path_service.dart';
 import 'package:flutter/services.dart';
 import 'package:dio/dio.dart';
 import 'package:download_manager/core/theme/app_colors.dart';
@@ -24,6 +25,8 @@ class _MainWindowState extends State<MainWindow> with ClipboardListener {
   bool _isAddDialogOpen = false;
   bool _isPauseRequested = false;
   final DownloadService _downloadService = DownloadService();
+  final DownloadPathService _downloadPathService = DownloadPathService();
+  String _downloadDirectory = '';
 
   CancelToken? _downloadCancelToken;
 
@@ -63,12 +66,28 @@ class _MainWindowState extends State<MainWindow> with ClipboardListener {
     ['No Hard Feelings.mp3', '8.5 MB', 'Finished', '—', '—', '100'],
     ['Competition.pdf', '12 MB', 'Finished', '—', '—', '100'],
   ];
+
+  Future<void> _loadDownloadDirectory() async {
+    final path = await _downloadPathService.getSavedPath();
+
+    if (!mounted) return;
+
+    setState(() {
+      _downloadDirectory = path;
+    });
+
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('Download location updated successfully')),
+    );
+  }
+
   @override
   void initState() {
     super.initState();
 
     clipboardWatcher.addListener(this);
     clipboardWatcher.start();
+    _loadDownloadDirectory();
   }
 
   @override
@@ -188,12 +207,11 @@ class _MainWindowState extends State<MainWindow> with ClipboardListener {
 
     final fileName = file[0].replaceAll(RegExp(r'[<>:"/\\|?*]'), '_');
 
-    final userProfile =
-        Platform.environment['USERPROFILE'] ?? Directory.current.path;
-
-    final savePath =
-        '$userProfile${Platform.pathSeparator}'
-        'Downloads${Platform.pathSeparator}$fileName';
+    final category = _downloadPathService.getCategoryForFile(fileName);
+    final savePath = await _downloadPathService.getFilePath(
+      fileName: fileName,
+      category: category,
+    );
 
     final shouldResume = file[2] == 'Paused';
     final cancelToken = CancelToken();
@@ -350,8 +368,6 @@ class _MainWindowState extends State<MainWindow> with ClipboardListener {
       }
     }
 
-    // Start the next queued download only after the current one finishes.
-    // Paused, stopped, and failed downloads do not advance the queue.
     if (downloadCompleted && mounted) {
       final nextIndex = _getNextQueuedDownload();
 
@@ -474,25 +490,19 @@ class _MainWindowState extends State<MainWindow> with ClipboardListener {
           ),
           actions: [
             TextButton(
-              onPressed: () {
-                Navigator.pop(dialogContext);
-              },
+              onPressed: () => Navigator.pop(dialogContext),
               child: const Text('Cancel'),
             ),
             ElevatedButton(
-              onPressed: () {
-                Navigator.pop(dialogContext, enteredUrl);
-              },
-              child: const Text('Add to Queue'),
+              onPressed: () => Navigator.pop(dialogContext, enteredUrl),
+              child: const Text('Continue'),
             ),
           ],
         );
       },
     );
 
-    if (!mounted || result == null || result.isEmpty) {
-      return;
-    }
+    if (!mounted || result == null || result.isEmpty) return;
 
     final uri = Uri.tryParse(result);
 
@@ -525,21 +535,119 @@ class _MainWindowState extends State<MainWindow> with ClipboardListener {
         : 'download_${DateTime.now().millisecondsSinceEpoch}';
 
     String fileSize = 'Unknown';
+    String fileType = 'Unknown';
+    String resumeSupport = 'Unknown';
 
     try {
       final info = await _downloadService.getFileInfo(result);
 
       fileName = info.fileName;
       fileSize = info.formattedSize;
+      fileType = info.fileType;
+      resumeSupport = info.supportsResume ? 'Supported' : 'Not supported';
     } catch (error) {
       debugPrint('Could not retrieve file information: $error');
+
+      final extension = fileName.contains('.')
+          ? fileName.split('.').last.toUpperCase()
+          : 'Unknown';
+
+      fileType = extension;
     }
 
     if (!mounted) return;
+
+    String dialogPath = _downloadDirectory;
+
+    if (dialogPath.isEmpty) {
+      dialogPath = await _downloadPathService.getSavedPath();
+    }
+
+    if (!mounted) return;
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) {
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            return AlertDialog(
+              backgroundColor: AppColors.surface,
+              title: const Text('Download Details'),
+              content: SizedBox(
+                width: 420,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    _buildDetailRow('File name', fileName),
+                    _buildDetailRow('File type', fileType),
+                    _buildDetailRow('File size', fileSize),
+                    _buildDetailRow('Resume', resumeSupport),
+
+                    const SizedBox(height: 20),
+
+                    const Text(
+                      'Save location',
+                      style: TextStyle(fontWeight: FontWeight.bold),
+                    ),
+
+                    const SizedBox(height: 8),
+
+                    Text(dialogPath, style: const TextStyle(fontSize: 12)),
+
+                    const SizedBox(height: 12),
+
+                    OutlinedButton.icon(
+                      onPressed: () async {
+                        final changed = await _downloadPathService
+                            .chooseDirectory();
+
+                        if (!changed || !dialogContext.mounted) return;
+
+                        final newPath = await _downloadPathService
+                            .getSavedPath();
+
+                        if (!dialogContext.mounted) return;
+
+                        setDialogState(() {
+                          dialogPath = newPath;
+                        });
+
+                        if (mounted) {
+                          setState(() {
+                            _downloadDirectory = newPath;
+                          });
+                        }
+                      },
+                      icon: const Icon(Icons.folder_open),
+                      label: const Text('Browse'),
+                    ),
+                  ],
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(dialogContext, false),
+                  child: const Text('Cancel'),
+                ),
+                ElevatedButton(
+                  onPressed: () => Navigator.pop(dialogContext, true),
+                  child: const Text('Start Download'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+
+    if (!mounted || confirmed != true) return;
+
     final shouldStartNow = !_isDownloadRunning;
 
     setState(() {
       files.add([fileName, fileSize, 'Queued', '—', '—', '0', result]);
+
       if (shouldStartNow) {
         selectedFileIndex = files.length - 1;
       }
@@ -555,6 +663,21 @@ class _MainWindowState extends State<MainWindow> with ClipboardListener {
 
   int get queuedCount {
     return files.where((file) => file[2] == 'Queued').length;
+  }
+
+  Widget _buildDetailRow(String title, String value) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 5),
+      child: Row(
+        children: [
+          SizedBox(
+            width: 110,
+            child: Text(title, style: const TextStyle(color: Colors.grey)),
+          ),
+          Expanded(child: Text(value, overflow: TextOverflow.ellipsis)),
+        ],
+      ),
+    );
   }
 
   Widget _sidebar() {
