@@ -92,7 +92,21 @@ class DownloadPathService {
     return true;
   }
 
+  Future<void> saveCategoryPath(String category, String directoryPath) async {
+    if (directoryPath.trim().isEmpty) return;
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setString('category_path_$category', directoryPath.trim());
+  }
+
   Future<String> getCategoryPath(String category) async {
+    final prefs = await SharedPreferences.getInstance();
+    final remembered = prefs.getString('category_path_$category');
+    if (remembered != null && remembered.isNotEmpty) {
+      final dir = Directory(remembered);
+      await dir.create(recursive: true);
+      return dir.path;
+    }
+
     final basePath = await getSavedPath();
 
     final folderName = categories[category] ?? 'Others';

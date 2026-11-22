@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Download Manager Connector</title>
+  <style>
+    body {
+      width: 300px;
+      margin: 0;
+      padding: 14px;
+      background: #0b0f0d;
+      color: #f1f5f3;
+      font-family: "Segoe UI", sans-serif;
+      font-size: 12.5px;
+    }
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid #232825;
+      padding-bottom: 10px;
+      margin-bottom: 12px;
+    }
+    .title {
+      font-weight: 600;
+      font-size: 13.5px;
+    }
+    .status {
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 10px;
+      background: #171d1a;
+      color: #91a39a;
+    }
+    .status.online {
+      background: #063c2a;
+      color: #00d58a;
+    }
+    .row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 12px;
+    }
+    input[type="text"] {
+      width: 100%;
+      box-sizing: border-box;
+      padding: 8px;
+      background: #000000;
+      color: #f1f5f3;
+      border: 1px solid #29312d;
+      border-radius: 4px;
+      margin-bottom: 8px;
+      font-size: 12px;
+    }
+    button {
+      width: 100%;
+      padding: 8px;
+      background: #00d58a;
+      color: #000000;
+      border: none;
+      border-radius: 4px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button:hover {
+      opacity: 0.92;
+    }
+    .feedback {
+      margin-top: 8px;
+      font-size: 11.5px;
+      min-height: 16px;
+      color: #91a39a;
+    }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <span class="title">Download Manager</span>
+    <span id="statusBadge" class="status">Checking...</span>
+  </div>
+
+  <label class="row">
+    <span>Auto-capture browser downloads</span>
+    <input id="autoCaptureToggle" type="checkbox" />
+  </label>
+
+  <input id="urlInput" type="text" placeholder="https://... or ftp://..." />
+  <button id="sendBtn" type="button">Send to Download Manager</button>
+  <div id="feedback" class="feedback"></div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

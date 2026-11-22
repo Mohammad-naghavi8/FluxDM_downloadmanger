@@ -4,7 +4,11 @@ import 'dart:io';
 import 'package:dio/dio.dart';
 import 'package:download_manager/features/downloads/models/download_file_info.dart';
 import 'package:download_manager/features/downloads/models/download_progress_state.dart';
+import 'package:download_manager/features/downloads/services/ftp_client_service.dart';
+import 'package:download_manager/features/downloads/services/go_engine_client.dart';
+import 'package:download_manager/features/downloads/services/go_engine_process.dart';
 import 'package:download_manager/features/downloads/services/speed_limiter.dart';
+import 'package:download_manager/features/downloads/utils/download_link_helper.dart';
 
 class _SegmentSpec {
   final int index;
@@ -38,7 +42,48 @@ class DownloadService {
   static const int defaultConnectionCount = 8;
   static const int minSegmentedSizeBytes = 1024 * 1024;
 
+  static final Map<String, String> _resolvedHttpsRedirectCache = {};
+
   Dio _dio = _createDio();
+  final FtpClientService _ftpClient = FtpClientService();
+  final GoEngineClient? _customGoClient;
+  final GoEngineClient _defaultGoClient = GoEngineClient();
+
+  DownloadService({GoEngineClient? goClient}) : _customGoClient = goClient;
+
+  bool get _useGoEngine =>
+      _customGoClient != null || GoEngineProcess.instance.isRunning;
+
+  GoEngineClient get _goClient => _customGoClient ?? _defaultGoClient;
+
+  Future<void> setLiveSpeedLimit(String taskId, int bytesPerSecond) async {
+    if (!_useGoEngine) return;
+    try {
+      await _goClient.setSpeedLimit(taskId, bytesPerSecond);
+    } catch (_) {}
+  }
+
+  Map<String, dynamic> _buildRequestHeaders({
+    String? username,
+    String? password,
+    Map<String, dynamic>? extra,
+  }) {
+    final headers = <String, dynamic>{...?extra};
+    if (username != null && username.isNotEmpty) {
+      final token = base64Encode(utf8.encode('$username:${password ?? ''}'));
+      headers['Authorization'] = 'Basic $token';
+    }
+    return headers;
+  }
+
+  Uri _applyFtpCredentials(Uri uri, String? username, String? password) {
+    if (username == null || username.isEmpty || uri.userInfo.isEmpty == false) {
+      return uri;
+    }
+    final userEncoded = Uri.encodeComponent(username);
+    final passEncoded = Uri.encodeComponent(password ?? '');
+    return uri.replace(userInfo: '$userEncoded:$passEncoded');
+  }
 
   static Dio _createDio() {
     return Dio(
@@ -60,6 +105,47 @@ class DownloadService {
     _dio.close(force: false);
     _dio = _createDio();
   }
+
+  /// If an HTTPS redirector host fails TLS handshake (e.g., an expired CDN edge
+  /// node in round-robin DNS), checks whether the same host redirects to a
+  /// healthy HTTPS CDN origin (strictly requiring an HTTPS target on a
+  /// different host so TLS verification is never weakened or downgraded).
+  Future<String?> _resolveHttpsCdnRedirect(
+    Uri uri, {
+    CancelToken? cancelToken,
+  }) async {
+    if (uri.scheme.toLowerCase() != 'https') return null;
+    final key = uri.toString();
+    final cached = _resolvedHttpsRedirectCache[key];
+    if (cached != null) return cached;
+
+    try {
+      final probeUri = uri.replace(scheme: 'http');
+      final response = await _dio.head<dynamic>(
+        probeUri.toString(),
+        cancelToken: cancelToken,
+        options: Options(
+          followRedirects: false,
+          validateStatus: (status) =>
+              status != null && status >= 300 && status < 400,
+        ),
+      );
+      final location = response.headers.value('location');
+      if (location == null || location.isEmpty) return null;
+
+      final target = probeUri.resolve(location);
+      if (target.scheme.toLowerCase() == 'https' &&
+          target.host.isNotEmpty &&
+          target.host.toLowerCase() != uri.host.toLowerCase()) {
+        final resolved = target.toString();
+        _resolvedHttpsRedirectCache[key] = resolved;
+        return resolved;
+      }
+    } catch (_) {}
+    return null;
+  }
+
+  String _effectiveUrl(String url) => _resolvedHttpsRedirectCache[url] ?? url;
 
   bool _isRetryableNodeError(Object error) {
     if (error is DioException) {
@@ -90,29 +176,42 @@ class DownloadService {
 
   Future<T> _runWithNodeFailover<T>(
     Uri uri,
-    Future<T> Function() action, {
+    Future<T> Function(String targetUrl) action, {
     CancelToken? cancelToken,
     int maxAttempts = 4,
   }) async {
     Object? lastError;
+    String currentUrl = _effectiveUrl(uri.toString());
+
     for (int attempt = 0; attempt < maxAttempts; attempt++) {
       if (cancelToken?.isCancelled ?? false) {
         throw DioException.requestCancelled(
-          requestOptions: RequestOptions(path: uri.toString()),
+          requestOptions: RequestOptions(path: currentUrl),
           reason: cancelToken?.cancelError?.error ?? 'Cancelled',
         );
       }
       try {
-        return await action();
+        return await action(currentUrl);
       } catch (error) {
         lastError = error;
         if (!_isRetryableNodeError(error) || attempt == maxAttempts - 1) {
           rethrow;
         }
-        // Reset HttpClient so the retry performs a fresh DNS/TCP/TLS connection
-        // (avoids sticking to a broken round-robin CDN edge node).
+        final isHandshake =
+            error is HandshakeException ||
+            (error is DioException && error.error is HandshakeException);
+        if (isHandshake && currentUrl == uri.toString()) {
+          final redirected = await _resolveHttpsCdnRedirect(
+            uri,
+            cancelToken: cancelToken,
+          );
+          if (redirected != null) {
+            currentUrl = redirected;
+            continue;
+          }
+        }
         _resetClient();
-        await Future<void>.delayed(const Duration(milliseconds: 250));
+        await Future<void>.delayed(const Duration(milliseconds: 200));
       }
     }
     throw lastError!;
@@ -127,6 +226,13 @@ class DownloadService {
   }
 
   Future<void> cleanupPartialFiles(String savePath) async {
+    if (_useGoEngine) {
+      try {
+        await _goClient.cleanupPartialFiles(savePath);
+        return;
+      } catch (_) {}
+    }
+
     int segmentCount = defaultConnectionCount;
 
     final stateFile = File(_stateFilePath(savePath));
@@ -166,6 +272,16 @@ class DownloadService {
     String savePath, {
     String pausedLabel = 'Paused',
   }) async {
+    if (_useGoEngine) {
+      try {
+        final saved = await _goClient.getSavedProgress(
+          savePath,
+          pausedLabel: pausedLabel,
+        );
+        return saved.connections;
+      } catch (_) {}
+    }
+
     final stateFile = File(_stateFilePath(savePath));
     if (!await stateFile.exists()) {
       return const [];
@@ -203,23 +319,41 @@ class DownloadService {
     }
   }
 
-  Future<DownloadFileInfo> getFileInfo(String url) async {
+  Future<DownloadFileInfo> getFileInfo(
+    String url, {
+    String? username,
+    String? password,
+  }) async {
     final uri = Uri.tryParse(url);
 
-    if (uri == null ||
-        !uri.hasAuthority ||
-        (uri.scheme != 'http' && uri.scheme != 'https')) {
+    if (!DownloadLinkHelper.isSupportedUri(uri)) {
       throw ArgumentError('Invalid download URL');
     }
+
+    if (_useGoEngine) {
+      return _goClient.probe(url, username: username, password: password);
+    }
+
+    if (uri!.scheme.toLowerCase() == 'ftp') {
+      return _ftpClient.getFileInfo(
+        _applyFtpCredentials(uri, username, password),
+      );
+    }
+
+    final authHeaders = _buildRequestHeaders(
+      username: username,
+      password: password,
+    );
 
     Response<dynamic> response;
     try {
       response = await _runWithNodeFailover(
         uri,
-        () => _dio.head(
-          url,
+        (targetUrl) => _dio.head(
+          targetUrl,
           options: Options(
             followRedirects: true,
+            headers: authHeaders.isNotEmpty ? authHeaders : null,
             validateStatus: (status) =>
                 status != null && status >= 200 && status < 400,
           ),
@@ -229,14 +363,19 @@ class DownloadService {
       final code = error.response?.statusCode;
       // Fallback to a 1-byte Range GET when servers reject HEAD requests.
       if (code == 403 || code == 405 || code == 501) {
+        final rangeHeaders = _buildRequestHeaders(
+          username: username,
+          password: password,
+          extra: const {'Range': 'bytes=0-0'},
+        );
         response = await _runWithNodeFailover(
           uri,
-          () => _dio.get<List<int>>(
-            url,
+          (targetUrl) => _dio.get<List<int>>(
+            targetUrl,
             options: Options(
               responseType: ResponseType.bytes,
               followRedirects: true,
-              headers: const {'Range': 'bytes=0-0'},
+              headers: rangeHeaders,
               validateStatus: (status) =>
                   status != null && (status == 200 || status == 206),
             ),
@@ -290,12 +429,22 @@ class DownloadService {
     final acceptRanges = response.headers.value('accept-ranges');
     final supportsResume =
         acceptRanges?.toLowerCase() == 'bytes' || response.statusCode == 206;
+    final contentType = response.headers.value('content-type');
+    final directCheck = DownloadLinkHelper.evaluateDirectDownload(
+      uri: effectiveUri,
+      contentType: contentType,
+      contentDisposition: disposition,
+    );
 
     return DownloadFileInfo(
       fileName: fileName,
       fileSize: fileSize,
       fileType: fileType,
       supportsResume: supportsResume,
+      protocol: DownloadLinkHelper.protocolLabel(effectiveUri),
+      isDirectDownload: directCheck.isDirect,
+      directDownloadReason: directCheck.reason,
+      contentType: contentType,
     );
   }
 
@@ -303,17 +452,50 @@ class DownloadService {
     required String url,
     required String savePath,
     required void Function(int received, int total) onProgress,
+    String? taskId,
+    String? username,
+    String? password,
     SpeedLimiter? speedLimiter,
     void Function(int attempt)? onReconnecting,
+    bool Function()? isPauseRequested,
     CancelToken? cancelToken,
     int maxReconnectAttempts = 10,
   }) async {
     final uri = Uri.tryParse(url);
 
-    if (uri == null ||
-        (uri.scheme != 'http' && uri.scheme != 'https') ||
-        uri.host.isEmpty) {
+    if (!DownloadLinkHelper.isSupportedUri(uri)) {
       throw ArgumentError('Invalid download URL');
+    }
+
+    if (_useGoEngine) {
+      await _goClient.streamDownload(
+        id: taskId ?? savePath,
+        url: url,
+        savePath: savePath,
+        segmented: false,
+        speedLimitBytesPerSec: speedLimiter?.getMaxBytesPerSecond() ?? 0,
+        username: username,
+        password: password,
+        maxReconnectAttempts: maxReconnectAttempts,
+        cancelToken: cancelToken,
+        isPauseRequested: isPauseRequested,
+        onProgress: onProgress,
+        onReconnecting: onReconnecting,
+      );
+      return;
+    }
+
+    if (uri!.scheme.toLowerCase() == 'ftp') {
+      await _ftpClient.downloadFile(
+        uri: _applyFtpCredentials(uri, username, password),
+        savePath: savePath,
+        onProgress: onProgress,
+        speedLimiter: speedLimiter,
+        onReconnecting: onReconnecting,
+        cancelToken: cancelToken,
+        maxReconnectAttempts: maxReconnectAttempts,
+      );
+      return;
     }
 
     final file = File(savePath);
@@ -338,14 +520,18 @@ class DownloadService {
       IOSink? sink;
 
       try {
+        final targetUrl = _effectiveUrl(url);
+        final reqHeaders = _buildRequestHeaders(
+          username: username,
+          password: password,
+          extra: isResumingAfterDrop ? {'Range': 'bytes=$received-'} : null,
+        );
         final response = await _dio.get<ResponseBody>(
-          url,
+          targetUrl,
           options: Options(
             responseType: ResponseType.stream,
             followRedirects: true,
-            headers: isResumingAfterDrop
-                ? {'Range': 'bytes=$received-'}
-                : null,
+            headers: reqHeaders.isNotEmpty ? reqHeaders : null,
             validateStatus: (status) => isResumingAfterDrop
                 ? status == 206
                 : (status != null && status >= 200 && status < 300),
@@ -447,6 +633,9 @@ class DownloadService {
     required String savePath,
     required int totalBytes,
     required void Function(int received, int total) onProgress,
+    String? taskId,
+    String? username,
+    String? password,
     void Function(List<DownloadConnectionProgress> connections)?
     onConnectionsChanged,
     void Function(
@@ -457,6 +646,7 @@ class DownloadService {
     onSegmentedProgress,
     void Function(int attempt)? onReconnecting,
     void Function()? onRebuilding,
+    bool Function()? isPauseRequested,
     SpeedLimiter? speedLimiter,
     CancelToken? cancelToken,
     int connectionCount = defaultConnectionCount,
@@ -473,6 +663,30 @@ class DownloadService {
 
     if (totalBytes <= 0) {
       throw ArgumentError('Total bytes must be positive for segmented download');
+    }
+
+    if (_useGoEngine) {
+      await _goClient.streamDownload(
+        id: taskId ?? savePath,
+        url: url,
+        savePath: savePath,
+        totalBytes: totalBytes,
+        connectionCount: connectionCount,
+        resumeExisting: resumeExisting,
+        segmented: true,
+        speedLimitBytesPerSec: speedLimiter?.getMaxBytesPerSecond() ?? 0,
+        username: username,
+        password: password,
+        maxReconnectAttempts: maxReconnectAttempts,
+        cancelToken: cancelToken,
+        isPauseRequested: isPauseRequested,
+        onProgress: onProgress,
+        onConnectionsChanged: onConnectionsChanged,
+        onSegmentedProgress: onSegmentedProgress,
+        onReconnecting: onReconnecting,
+        onRebuilding: onRebuilding,
+      );
+      return;
     }
 
     final targetFile = File(savePath);
@@ -567,15 +781,20 @@ class DownloadService {
     // Resolve any initial CDN redirects once so all 8 segments target the
     // resolved edge host directly instead of hitting round-robin redirectors
     // 8 separate times.
-    String effectiveUrl = url;
+    String effectiveUrl = _effectiveUrl(url);
+    final authHeaders = _buildRequestHeaders(
+      username: username,
+      password: password,
+    );
     try {
       final headResp = await _runWithNodeFailover(
         uri,
-        () => _dio.head(
-          url,
+        (targetUrl) => _dio.head(
+          targetUrl,
           cancelToken: cancelToken,
           options: Options(
             followRedirects: true,
+            headers: authHeaders.isNotEmpty ? authHeaders : null,
             validateStatus: (status) =>
                 status != null && status >= 200 && status < 400,
           ),
@@ -647,12 +866,17 @@ class DownloadService {
 
         IOSink? sink;
         try {
+          final segHeaders = _buildRequestHeaders(
+            username: username,
+            password: password,
+            extra: {'Range': 'bytes=$rangeStart-$rangeEnd'},
+          );
           final response = await _dio.get<ResponseBody>(
             effectiveUrl,
             options: Options(
               responseType: ResponseType.stream,
               followRedirects: true,
-              headers: {'Range': 'bytes=$rangeStart-$rangeEnd'},
+              headers: segHeaders,
               validateStatus: (status) => status == 206,
             ),
             cancelToken: sharedCancelToken,
@@ -856,6 +1080,13 @@ class DownloadService {
   }
 
   Future<int> getDownloadedBytes(String savePath) async {
+    if (_useGoEngine) {
+      try {
+        final saved = await _goClient.getSavedProgress(savePath);
+        return saved.downloadedBytes;
+      } catch (_) {}
+    }
+
     final stateFile = File(_stateFilePath(savePath));
     if (await stateFile.exists()) {
       try {
@@ -883,18 +1114,48 @@ class DownloadService {
     return await file.length();
   }
 
-  Future<bool> supportsResume(String url, {CancelToken? cancelToken}) async {
+  Future<bool> supportsResume(
+    String url, {
+    String? username,
+    String? password,
+    CancelToken? cancelToken,
+  }) async {
     final uri = Uri.tryParse(url);
-    if (uri == null || !uri.hasAuthority) return false;
+    if (!DownloadLinkHelper.isSupportedUri(uri)) return false;
+
+    if (_useGoEngine) {
+      try {
+        final info = await _goClient.probe(
+          url,
+          username: username,
+          password: password,
+        );
+        return info.supportsResume;
+      } catch (_) {
+        return false;
+      }
+    }
+
+    if (uri!.scheme.toLowerCase() == 'ftp') {
+      return _ftpClient.supportsResume(
+        _applyFtpCredentials(uri, username, password),
+      );
+    }
+
+    final authHeaders = _buildRequestHeaders(
+      username: username,
+      password: password,
+    );
 
     try {
       final response = await _runWithNodeFailover(
         uri,
-        () => _dio.head(
-          url,
+        (targetUrl) => _dio.head(
+          targetUrl,
           cancelToken: cancelToken,
           options: Options(
             followRedirects: true,
+            headers: authHeaders.isNotEmpty ? authHeaders : null,
             validateStatus: (status) =>
                 status != null && status >= 200 && status < 400,
           ),
@@ -915,8 +1176,12 @@ class DownloadService {
     required String savePath,
     required int downloadedBytes,
     required void Function(int received, int total) onProgress,
+    String? taskId,
+    String? username,
+    String? password,
     SpeedLimiter? speedLimiter,
     void Function(int attempt)? onReconnecting,
+    bool Function()? isPauseRequested,
     CancelToken? cancelToken,
     int maxReconnectAttempts = 10,
   }) async {
@@ -936,6 +1201,45 @@ class DownloadService {
       throw Exception('Downloaded file size does not match resume position');
     }
 
+    final uri = Uri.tryParse(url);
+    if (!DownloadLinkHelper.isSupportedUri(uri)) {
+      throw ArgumentError('Invalid download URL');
+    }
+
+    if (_useGoEngine) {
+      await _goClient.streamDownload(
+        id: taskId ?? savePath,
+        url: url,
+        savePath: savePath,
+        resumeExisting: true,
+        initialOffset: downloadedBytes,
+        segmented: false,
+        speedLimitBytesPerSec: speedLimiter?.getMaxBytesPerSecond() ?? 0,
+        username: username,
+        password: password,
+        maxReconnectAttempts: maxReconnectAttempts,
+        cancelToken: cancelToken,
+        isPauseRequested: isPauseRequested,
+        onProgress: onProgress,
+        onReconnecting: onReconnecting,
+      );
+      return;
+    }
+
+    if (uri!.scheme.toLowerCase() == 'ftp') {
+      await _ftpClient.downloadFile(
+        uri: _applyFtpCredentials(uri, username, password),
+        savePath: savePath,
+        initialOffset: downloadedBytes,
+        onProgress: onProgress,
+        speedLimiter: speedLimiter,
+        onReconnecting: onReconnecting,
+        cancelToken: cancelToken,
+        maxReconnectAttempts: maxReconnectAttempts,
+      );
+      return;
+    }
+
     final stopwatch = Stopwatch()..start();
     var lastEmitMs = -200;
     var received = downloadedBytes;
@@ -952,12 +1256,18 @@ class DownloadService {
 
       IOSink? sink;
       try {
+        final targetUrl = _effectiveUrl(url);
+        final resumeHeaders = _buildRequestHeaders(
+          username: username,
+          password: password,
+          extra: {'Range': 'bytes=$received-'},
+        );
         final response = await _dio.get<ResponseBody>(
-          url,
+          targetUrl,
           options: Options(
             responseType: ResponseType.stream,
             followRedirects: true,
-            headers: {'Range': 'bytes=$received-'},
+            headers: resumeHeaders,
             validateStatus: (status) => status == 206,
           ),
           cancelToken: cancelToken,

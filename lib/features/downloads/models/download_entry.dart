@@ -13,6 +13,8 @@ class DownloadEntry {
   int? totalBytes;
   bool? supportsResume;
   DateTime? scheduledAt;
+  String? username;
+  String? password;
 
   DownloadEntry({
     required this.id,
@@ -29,6 +31,8 @@ class DownloadEntry {
     this.totalBytes,
     this.supportsResume,
     this.scheduledAt,
+    this.username,
+    this.password,
   });
 
   bool get isDownloading => status == 'Downloading';

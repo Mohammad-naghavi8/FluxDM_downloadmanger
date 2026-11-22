@@ -10,6 +10,7 @@ class DownloadToolbar extends StatelessWidget {
   final VoidCallback onDelete;
   final VoidCallback onStartQueue;
   final VoidCallback onOpenScheduler;
+  final VoidCallback onOpenBrowserBridge;
 
   const DownloadToolbar({
     super.key,
@@ -21,6 +22,7 @@ class DownloadToolbar extends StatelessWidget {
     required this.onDelete,
     required this.onStartQueue,
     required this.onOpenScheduler,
+    required this.onOpenBrowserBridge,
   });
 
   @override
@@ -56,6 +58,11 @@ class DownloadToolbar extends StatelessWidget {
             Icons.schedule_rounded,
             tooltip: 'Scheduler & Concurrency',
             onPressed: onOpenScheduler,
+          ),
+          _tool(
+            Icons.language_rounded,
+            tooltip: 'Browser Integration',
+            onPressed: onOpenBrowserBridge,
           ),
           const Spacer(),
           _tool(

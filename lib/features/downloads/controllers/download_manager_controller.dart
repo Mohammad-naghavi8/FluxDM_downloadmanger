@@ -9,6 +9,7 @@ import 'package:download_manager/features/downloads/models/download_schedule_con
 import 'package:download_manager/features/downloads/services/download_path_service.dart';
 import 'package:download_manager/features/downloads/services/download_service.dart';
 import 'package:download_manager/features/downloads/services/speed_limiter.dart';
+import 'package:download_manager/features/downloads/utils/download_link_helper.dart';
 import 'package:flutter/foundation.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -203,6 +204,10 @@ class DownloadManagerController extends ChangeNotifier {
     // Sync active progress states with updated effective speed limit.
     for (final entry in files) {
       final limitBps = effectiveSpeedLimitForEntry(entry.id);
+      final activeSession = _activeSessions[entry.id];
+      if (activeSession != null) {
+        unawaited(activeSession.service.setLiveSpeedLimit(entry.id, limitBps));
+      }
       _updateProgressForEntry(
         entry,
         (current) => current.copyWith(
@@ -248,6 +253,12 @@ class DownloadManagerController extends ChangeNotifier {
     final entry = findEntryById(entryId);
     if (entry != null) {
       final activeLimit = effectiveSpeedLimitForEntry(entryId);
+      final activeSession = _activeSessions[entryId];
+      if (activeSession != null) {
+        unawaited(
+          activeSession.service.setLiveSpeedLimit(entryId, activeLimit),
+        );
+      }
       _updateProgressForEntry(
         entry,
         (current) => current.copyWith(
@@ -293,6 +304,12 @@ class DownloadManagerController extends ChangeNotifier {
       final statusCode = error.response?.statusCode;
       if (statusCode != null) {
         return 'Server returned HTTP $statusCode';
+      }
+      if (error.error is HandshakeException) {
+        return 'SSL certificate error';
+      }
+      if (error.error is SocketException) {
+        return 'Connection failed (check internet)';
       }
       if (error.message != null && error.message!.trim().isNotEmpty) {
         return error.message!.trim();
@@ -346,6 +363,8 @@ class DownloadManagerController extends ChangeNotifier {
   ) async {
     final supported = await session.service.supportsResume(
       entry.url,
+      username: entry.username,
+      password: entry.password,
       cancelToken: session.cancelToken,
     );
 
@@ -443,14 +462,15 @@ class DownloadManagerController extends ChangeNotifier {
     DownloadFileInfo? fileInfo,
     bool startNow = true,
     DateTime? scheduledAt,
+    String? username,
+    String? password,
+    String? savePath,
+    String? category,
   }) async {
     final uri = Uri.tryParse(url);
 
-    if (uri == null ||
-        !uri.hasAuthority ||
-        !uri.hasScheme ||
-        (uri.scheme != 'http' && uri.scheme != 'https')) {
-      _emitMessage('Please enter a valid HTTP or HTTPS URL');
+    if (!DownloadLinkHelper.isSupportedUri(uri)) {
+      _emitMessage('Please enter a valid HTTP, HTTPS, or FTP URL');
       return null;
     }
 
@@ -460,25 +480,41 @@ class DownloadManagerController extends ChangeNotifier {
       return null;
     }
 
-    final fileName =
+    String fileName =
         fileInfo?.fileName ??
-        (uri.pathSegments.isNotEmpty && uri.pathSegments.last.isNotEmpty
+        (uri!.pathSegments.isNotEmpty && uri.pathSegments.last.isNotEmpty
             ? Uri.decodeComponent(uri.pathSegments.last)
             : 'download_${DateTime.now().millisecondsSinceEpoch}');
 
-    final category = downloadPathService.getCategoryForFile(fileName);
-    final isScheduled = scheduledAt != null && scheduledAt.isAfter(DateTime.now());
+    final customSavePath = savePath?.trim() ?? '';
+    if (customSavePath.isNotEmpty) {
+      final sep = Platform.pathSeparator;
+      final lastSep = customSavePath.lastIndexOf(sep);
+      if (lastSep != -1 && lastSep < customSavePath.length - 1) {
+        fileName = customSavePath.substring(lastSep + 1);
+      }
+    }
+
+    final resolvedCategory =
+        (category != null && category.isNotEmpty)
+        ? category
+        : downloadPathService.getCategoryForFile(fileName);
+    final isScheduled =
+        scheduledAt != null && scheduledAt.isAfter(DateTime.now());
 
     final entry = DownloadEntry(
       id: _nextId(),
       fileName: fileName,
       url: url,
-      category: category,
+      savePath: customSavePath,
+      category: resolvedCategory,
       sizeText: fileInfo?.formattedSize ?? 'Unknown',
       status: isScheduled ? 'Scheduled' : 'Queued',
       totalBytes: fileInfo?.fileSize,
       supportsResume: fileInfo?.supportsResume,
       scheduledAt: isScheduled ? scheduledAt : null,
+      username: username,
+      password: password,
     );
 
     if (isScheduled) {
@@ -760,7 +796,11 @@ class DownloadManagerController extends ChangeNotifier {
 
       if (entry.supportsResume == null || entry.totalBytes == null) {
         try {
-          final info = await sessionService.getFileInfo(url);
+          final info = await sessionService.getFileInfo(
+            url,
+            username: entry.username,
+            password: entry.password,
+          );
           if (_disposed || cancelToken.isCancelled) return;
 
           entry.supportsResume = info.supportsResume;
@@ -918,7 +958,11 @@ class DownloadManagerController extends ChangeNotifier {
       if (_disposed) return;
 
       final resolvedTotal = entry.totalBytes;
+      final isHttpProtocol =
+          url.toLowerCase().startsWith('http://') ||
+          url.toLowerCase().startsWith('https://');
       final canUseSegmented =
+          isHttpProtocol &&
           scheduleConfig.segmentsPerDownload > 1 &&
           entry.supportsResume == true &&
           resolvedTotal != null &&
@@ -927,6 +971,8 @@ class DownloadManagerController extends ChangeNotifier {
       if (shouldResume && hasSegmented && resolvedTotal != null) {
         final canResume = await sessionService.supportsResume(
           url,
+          username: entry.username,
+          password: entry.password,
           cancelToken: cancelToken,
         );
         if (_disposed) return;
@@ -944,11 +990,15 @@ class DownloadManagerController extends ChangeNotifier {
         session.lastReceivedBytes = downloadedBytes;
 
         await sessionService.downloadFileSegmented(
+          taskId: entry.id,
           url: url,
           savePath: savePath,
           totalBytes: resolvedTotal,
+          username: entry.username,
+          password: entry.password,
           connectionCount: scheduleConfig.segmentsPerDownload,
           speedLimiter: session.speedLimiter,
+          isPauseRequested: () => session.isPauseRequested,
           cancelToken: cancelToken,
           resumeExisting: true,
           onProgress: (r, t) => handleProgress(r, t),
@@ -960,6 +1010,8 @@ class DownloadManagerController extends ChangeNotifier {
       } else if (shouldResume && downloadedBytes > 0) {
         final canResume = await sessionService.supportsResume(
           url,
+          username: entry.username,
+          password: entry.password,
           cancelToken: cancelToken,
         );
         if (_disposed) return;
@@ -977,21 +1029,29 @@ class DownloadManagerController extends ChangeNotifier {
         session.lastReceivedBytes = downloadedBytes;
 
         await sessionService.resumeDownload(
+          taskId: entry.id,
           url: url,
           savePath: savePath,
           downloadedBytes: downloadedBytes,
+          username: entry.username,
+          password: entry.password,
           speedLimiter: session.speedLimiter,
+          isPauseRequested: () => session.isPauseRequested,
           onReconnecting: reconnectingCallback,
           cancelToken: cancelToken,
           onProgress: (r, t) => handleProgress(r, t),
         );
       } else if (canUseSegmented) {
         await sessionService.downloadFileSegmented(
+          taskId: entry.id,
           url: url,
           savePath: savePath,
           totalBytes: resolvedTotal,
+          username: entry.username,
+          password: entry.password,
           connectionCount: scheduleConfig.segmentsPerDownload,
           speedLimiter: session.speedLimiter,
+          isPauseRequested: () => session.isPauseRequested,
           cancelToken: cancelToken,
           resumeExisting: false,
           onProgress: (r, t) => handleProgress(r, t),
@@ -1002,9 +1062,13 @@ class DownloadManagerController extends ChangeNotifier {
         );
       } else {
         await sessionService.downloadFile(
+          taskId: entry.id,
           url: url,
           savePath: savePath,
+          username: entry.username,
+          password: entry.password,
           speedLimiter: session.speedLimiter,
+          isPauseRequested: () => session.isPauseRequested,
           onReconnecting: reconnectingCallback,
           cancelToken: cancelToken,
           onProgress: (r, t) => handleProgress(r, t),

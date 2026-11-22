@@ -1,11 +1,18 @@
+import 'dart:async';
+
 import 'package:clipboard_watcher/clipboard_watcher.dart';
 import 'package:download_manager/core/widgets/sidebar.dart';
 import 'package:download_manager/core/widgets/toolbar.dart';
 import 'package:download_manager/features/downloads/controllers/download_manager_controller.dart';
 import 'package:download_manager/features/downloads/models/download_progress_state.dart';
+import 'package:download_manager/features/downloads/services/browser_bridge_service.dart';
+import 'package:download_manager/features/downloads/services/go_engine_process.dart';
+import 'package:download_manager/features/downloads/utils/download_link_helper.dart';
 import 'package:download_manager/features/downloads/widgets/add_download_dialog.dart';
+import 'package:download_manager/features/downloads/widgets/browser_integration_dialog.dart';
 import 'package:download_manager/features/downloads/widgets/download_list_view.dart';
 import 'package:download_manager/features/downloads/widgets/download_progress_window.dart';
+import 'package:download_manager/features/downloads/widgets/enter_address_dialog.dart';
 import 'package:download_manager/features/downloads/widgets/scheduler_dialog.dart';
 import 'package:flutter/services.dart';
 import 'package:material_ui/material_ui.dart';
@@ -19,7 +26,9 @@ class MainWindow extends StatefulWidget {
 
 class _MainWindowState extends State<MainWindow> with ClipboardListener {
   late final DownloadManagerController _controller;
+  final BrowserBridgeService _browserBridge = BrowserBridgeService();
   bool _isAddDialogOpen = false;
+  String? _lastClipboardUrl;
 
   @override
   void initState() {
@@ -29,14 +38,46 @@ class _MainWindowState extends State<MainWindow> with ClipboardListener {
     clipboardWatcher.addListener(this);
     clipboardWatcher.start();
     _controller.initialize();
+    _startBrowserBridge();
+    unawaited(GoEngineProcess.instance.ensureStarted());
   }
 
   @override
   void dispose() {
     clipboardWatcher.removeListener(this);
     clipboardWatcher.stop();
+    _browserBridge.stop();
     _controller.dispose();
+    unawaited(GoEngineProcess.instance.stop());
     super.dispose();
+  }
+
+  Future<void> _startBrowserBridge() async {
+    await _browserBridge.start(
+      onLinkReceived: (link) {
+        if (!mounted) return;
+        _handleBrowserLink(link);
+      },
+    );
+  }
+
+  Future<void> _handleBrowserLink(BrowserCapturedLink link) async {
+    if (link.autoStart) {
+      await _controller.addDownload(url: link.url, startNow: true);
+      return;
+    }
+
+    if (_isAddDialogOpen) {
+      await _controller.addDownload(url: link.url, startNow: false);
+      return;
+    }
+
+    _isAddDialogOpen = true;
+    try {
+      await _showAddDownloadDialog(initialUrl: link.url);
+    } finally {
+      _isAddDialogOpen = false;
+    }
   }
 
   void _showSnackBar(String message) {
@@ -49,28 +90,68 @@ class _MainWindowState extends State<MainWindow> with ClipboardListener {
   @override
   Future<void> onClipboardChanged() async {
     final data = await Clipboard.getData(Clipboard.kTextPlain);
-    final text = data?.text?.trim();
+    final rawText = data?.text;
 
-    if (!mounted || text == null || text.isEmpty) return;
+    if (!mounted || rawText == null || rawText.trim().isEmpty) return;
 
-    final uri = Uri.tryParse(text);
-    if (uri == null ||
-        !uri.hasAuthority ||
-        (uri.scheme != 'http' && uri.scheme != 'https')) {
+    final extractedUrl = DownloadLinkHelper.extractSupportedUrl(rawText);
+    if (extractedUrl == null || extractedUrl == _lastClipboardUrl) return;
+
+    final uri = Uri.tryParse(extractedUrl);
+    if (uri == null || !DownloadLinkHelper.isLikelyDirectDownloadUrl(uri)) {
       return;
     }
+
+    _lastClipboardUrl = extractedUrl;
 
     if (_isAddDialogOpen) return;
 
     _isAddDialogOpen = true;
     try {
-      await _showAddDownloadDialog(initialUrl: text);
+      await _showAddDownloadDialog(initialUrl: extractedUrl);
     } finally {
       _isAddDialogOpen = false;
     }
   }
 
-  Future<void> _showAddDownloadDialog({String? initialUrl}) async {
+  Future<void> _showEnterAddressFlow() async {
+    if (_isAddDialogOpen) return;
+
+    _isAddDialogOpen = true;
+    try {
+      String? prefilledUrl;
+      try {
+        final clipData = await Clipboard.getData(Clipboard.kTextPlain);
+        final raw = clipData?.text;
+        if (raw != null && raw.trim().isNotEmpty) {
+          prefilledUrl = DownloadLinkHelper.extractSupportedUrl(raw);
+        }
+      } catch (_) {}
+
+      if (!mounted) return;
+
+      final addressResult = await showDialog<EnterAddressResult>(
+        context: context,
+        builder: (_) => EnterAddressDialog(initialUrl: prefilledUrl),
+      );
+
+      if (!mounted || addressResult == null) return;
+
+      await _showAddDownloadDialog(
+        initialUrl: addressResult.url,
+        initialUsername: addressResult.username,
+        initialPassword: addressResult.password,
+      );
+    } finally {
+      _isAddDialogOpen = false;
+    }
+  }
+
+  Future<void> _showAddDownloadDialog({
+    String? initialUrl,
+    String? initialUsername,
+    String? initialPassword,
+  }) async {
     String dialogPath = _controller.downloadDirectory;
     if (dialogPath.isEmpty) {
       dialogPath = await _controller.downloadPathService.getSavedPath();
@@ -84,6 +165,8 @@ class _MainWindowState extends State<MainWindow> with ClipboardListener {
         downloadPathService: _controller.downloadPathService,
         initialDirectory: dialogPath,
         initialUrl: initialUrl,
+        initialUsername: initialUsername,
+        initialPassword: initialPassword,
         formatError: _controller.formatErrorMessage,
         onDirectoryChanged: _controller.updateDownloadDirectory,
       ),
@@ -96,6 +179,10 @@ class _MainWindowState extends State<MainWindow> with ClipboardListener {
       fileInfo: result.fileInfo,
       startNow: result.startNow,
       scheduledAt: result.scheduledAt,
+      username: result.username,
+      password: result.password,
+      savePath: result.savePath,
+      category: result.category,
     );
   }
 
@@ -125,6 +212,13 @@ class _MainWindowState extends State<MainWindow> with ClipboardListener {
     }
   }
 
+  Future<void> _showBrowserIntegrationDialog() async {
+    await showDialog<void>(
+      context: context,
+      builder: (_) => BrowserIntegrationDialog(bridgeService: _browserBridge),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -133,7 +227,7 @@ class _MainWindowState extends State<MainWindow> with ClipboardListener {
           Row(
             children: [
               DownloadToolbar(
-                onAdd: _showAddDownloadDialog,
+                onAdd: _showEnterAddressFlow,
                 onStart: _controller.startSelectedDownload,
                 onPause: _controller.pauseSelectedDownload,
                 onStop: _controller.stopSelectedDownload,
@@ -141,6 +235,7 @@ class _MainWindowState extends State<MainWindow> with ClipboardListener {
                 onDelete: _controller.deleteSelectedDownload,
                 onStartQueue: _controller.startQueue,
                 onOpenScheduler: _showSchedulerDialog,
+                onOpenBrowserBridge: _showBrowserIntegrationDialog,
               ),
               Expanded(
                 child: ListenableBuilder(

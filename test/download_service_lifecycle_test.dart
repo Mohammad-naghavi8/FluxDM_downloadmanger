@@ -78,7 +78,7 @@ void main() {
             final chunkEnd = (offset + chunkSize).clamp(0, slice.length);
             request.response.add(slice.sublist(offset, chunkEnd));
             await request.response.flush();
-            await Future<void>.delayed(const Duration(milliseconds: 25));
+            await Future<void>.delayed(const Duration(milliseconds: 50));
           }
           await request.response.close();
           return;
