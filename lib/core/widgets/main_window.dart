@@ -157,6 +157,7 @@ class _MainWindowState extends State<MainWindow> with ClipboardListener {
           ),
           _tool(Icons.stop_outlined, onPressed: _stopSelectedDownload),
           _tool(Icons.close),
+          _tool(Icons.refresh, onPressed: _retrySelectedDownload),
           _tool(Icons.delete_outline, onPressed: _deleteSelectedDownload),
           const Spacer(),
           _tool(Icons.settings),
@@ -177,6 +178,7 @@ class _MainWindowState extends State<MainWindow> with ClipboardListener {
     if (icon == Icons.play_circle_outline_sharp) return 'Start';
     if (icon == Icons.pause_circle_outline_outlined) return 'Pause';
     if (icon == Icons.stop_outlined) return 'Stop';
+    if (icon == Icons.refresh) return 'Retry';
     if (icon == Icons.delete_outline) return 'Delete';
     return '';
   }
@@ -355,7 +357,11 @@ class _MainWindowState extends State<MainWindow> with ClipboardListener {
       if (!mounted) return;
 
       setState(() {
-        file[2] = paused ? 'Paused' : 'Stopped';
+        file[2] = paused
+            ? 'Paused'
+            : cancelled
+            ? 'Stopped'
+            : 'Failed';
         file[3] = '—';
         file[4] = '—';
         if (!paused) {
@@ -453,6 +459,23 @@ class _MainWindowState extends State<MainWindow> with ClipboardListener {
       file[4] = '—';
       file[5] = '0';
     });
+  }
+
+  void _retrySelectedDownload() {
+    if (files.isEmpty) return;
+
+    final status = files[selectedFileIndex][2];
+
+    if (status != 'Failed' && status != 'Stopped') {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Only failed or stopped downloads can be retried.'),
+        ),
+      );
+      return;
+    }
+
+    _startSelectedDownload();
   }
 
   void _deleteSelectedDownload() {
@@ -981,6 +1004,7 @@ class _MainWindowState extends State<MainWindow> with ClipboardListener {
       'Paused' => AppColors.paused,
       'Queued' => Colors.cyanAccent,
       'Stopped' => Colors.redAccent,
+      'Failed' => Colors.redAccent,
       'Finished' => Colors.greenAccent,
       _ => AppColors.textSecondary,
     };
@@ -1131,6 +1155,7 @@ class _MainWindowState extends State<MainWindow> with ClipboardListener {
       'Paused' => AppColors.paused,
       'Queued' => Colors.cyanAccent,
       'Stopped' => Colors.redAccent,
+      'Failed' => Colors.redAccent,
       'Finished' => Colors.greenAccent,
       _ => AppColors.textSecondary,
     };
